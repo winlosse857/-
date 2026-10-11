@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta
 
 import telebot
-from telebot import types
+from telebot import types, apihelper
 
 # ============ КОНФИГ ИЗ ОКРУЖЕНИЯ ============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -17,7 +17,10 @@ if not BOT_TOKEN:
     )
 
 _admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
-ADMIN_IDS = [int(x) for x in _admin_ids_raw.split(",") if x.strip().isdigit()]
+ADMIN_IDS = [
+    int(x.strip()) for x in _admin_ids_raw.split(",")
+    if x.strip().isdigit()
+]
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posts.db")
 # ============================================
@@ -78,9 +81,11 @@ def db_add_channel(user_id: int, chat_id: int, title: str, username: str | None)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        """INSERT OR REPLACE INTO channels
-           (user_id, chat_id, title, username, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
+        """INSERT INTO channels (user_id, chat_id, title, username, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, chat_id) DO UPDATE SET
+               title = excluded.title,
+               username = excluded.username""",
         (user_id, chat_id, title, username,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
@@ -206,6 +211,22 @@ def preview_text(text: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
+def send_safe(send_func, chat_id, *args, **kwargs):
+    """
+    Отправляет сообщение. Если Telegram не смог распарсить HTML —
+    отправляет без разметки. Прочие ошибки пробрасывает наверх.
+    """
+    try:
+        return send_func(chat_id, *args, **kwargs)
+    except apihelper.ApiTelegramException as e:
+        desc = (e.description or "").lower()
+        if "can't parse entities" in desc or "parse" in desc and "entit" in desc:
+            log.warning(f"HTML-парсинг не удался, отправка без разметки: {e}")
+            kwargs["parse_mode"] = None
+            return send_func(chat_id, *args, **kwargs)
+        raise
+
+
 def verify_bot_in_channel(chat_id) -> tuple[bool, str]:
     """Проверяет, что бот — админ канала. Возвращает (ok, сообщение_об_ошибке)."""
     try:
@@ -214,9 +235,14 @@ def verify_bot_in_channel(chat_id) -> tuple[bool, str]:
         if member.status in ("administrator", "creator"):
             return True, ""
         return False, ("Я не администратор этого канала. "
-                       "Добавьте меня в канал и выдайте право «Публикация сообщений».")
-    except telebot.apihelper.ApiTelegramException as e:
-        return False, f"Не удалось проверить права в канале: {e.description}"
+                       "Добавьте меня в канал и выдайте право "
+                       "«Публикация сообщений».")
+    except apihelper.ApiTelegramException as e:
+        desc = (e.description or "").lower()
+        if "chat not found" in desc or "member not found" in desc:
+            return False, ("Я не вижу этот канал. Убедитесь, что добавили "
+                           "меня в канал и назначили администратором.")
+        return False, f"Ошибка Telegram API: {e.description}"
     except Exception as e:
         return False, f"Ошибка проверки канала: {e}"
 
@@ -232,23 +258,27 @@ def publish_post(post_id: int):
 
     try:
         if ctype == "text":
-            bot.send_message(channel_id, text, disable_web_page_preview=False)
+            send_safe(bot.send_message, channel_id, text,
+                      disable_web_page_preview=False)
         elif ctype == "photo":
-            bot.send_photo(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_photo, channel_id, file_id, caption=text or None)
         elif ctype == "video":
-            bot.send_video(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_video, channel_id, file_id, caption=text or None)
         elif ctype == "document":
-            bot.send_document(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_document, channel_id, file_id, caption=text or None)
         elif ctype == "audio":
-            bot.send_audio(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_audio, channel_id, file_id, caption=text or None)
         elif ctype == "voice":
-            bot.send_voice(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_voice, channel_id, file_id, caption=text or None)
         elif ctype == "sticker":
             bot.send_sticker(channel_id, file_id)
         elif ctype == "animation":
-            bot.send_animation(channel_id, file_id, caption=text or None)
+            send_safe(bot.send_animation, channel_id, file_id, caption=text or None)
         elif ctype == "video_note":
             bot.send_video_note(channel_id, file_id)
+        else:
+            log.warning(f"Неизвестный тип контента: {ctype}")
+            return
 
         db_mark_published(post_id)
         log.info(f"Пост #{post_id} ({ctype}) → канал {channel_id}")
@@ -271,13 +301,13 @@ def schedule_worker():
     while True:
         try:
             now = datetime.now()
-            for post_id, *_ in db_get_pending_posts():
-                row = db_get_post(post_id)
-                if not row:
-                    continue
+            for (post_id, user_id, channel_id, ctype,
+                 text, file_id, publish_at_str) in db_get_pending_posts():
                 try:
-                    publish_at = datetime.strptime(row[6], "%Y-%m-%d %H:%M:%S")
+                    publish_at = datetime.strptime(publish_at_str,
+                                                   "%Y-%m-%d %H:%M:%S")
                 except ValueError:
+                    log.warning(f"Битая дата у поста #{post_id}: {publish_at_str}")
                     continue
                 if publish_at <= now:
                     publish_post(post_id)
@@ -315,16 +345,20 @@ def time_presets_kb():
         hour=9, minute=0, second=0, microsecond=0)
 
     kb.add(
-        types.InlineKeyboardButton("⏱ Через 10 мин",
-                                   callback_data=f"t:{int((now + timedelta(minutes=10)).timestamp())}"),
-        types.InlineKeyboardButton("⏱ Через 1 час",
-                                   callback_data=f"t:{int((now + timedelta(hours=1)).timestamp())}"),
+        types.InlineKeyboardButton(
+            "⏱ Через 10 мин",
+            callback_data=f"t:{int((now + timedelta(minutes=10)).timestamp())}"),
+        types.InlineKeyboardButton(
+            "⏱ Через 1 час",
+            callback_data=f"t:{int((now + timedelta(hours=1)).timestamp())}"),
     )
     kb.add(
-        types.InlineKeyboardButton("🕕 Сегодня в 18:00",
-                                   callback_data=f"t:{int(today_18.timestamp())}"),
-        types.InlineKeyboardButton("🌅 Завтра в 9:00",
-                                   callback_data=f"t:{int(tomorrow_9.timestamp())}"),
+        types.InlineKeyboardButton(
+            "🕕 Сегодня в 18:00",
+            callback_data=f"t:{int(today_18.timestamp())}"),
+        types.InlineKeyboardButton(
+            "🌅 Завтра в 9:00",
+            callback_data=f"t:{int(tomorrow_9.timestamp())}"),
     )
     kb.add(types.InlineKeyboardButton("⌨️ Ввести вручную",
                                       callback_data="menu:manual_time"))
@@ -336,21 +370,24 @@ def confirm_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("✅ Запланировать", callback_data="menu:confirm"),
-        types.InlineKeyboardButton("📢 Изменить канал", callback_data="menu:rewrite_channel"),
-        types.InlineKeyboardButton("✏️ Изменить текст", callback_data="menu:rewrite_text"),
-        types.InlineKeyboardButton("🕒 Изменить время", callback_data="menu:rewrite_time"),
+        types.InlineKeyboardButton("📢 Изменить канал",
+                                   callback_data="menu:rewrite_channel"),
+        types.InlineKeyboardButton("✏️ Изменить текст",
+                                   callback_data="menu:rewrite_text"),
+        types.InlineKeyboardButton("🕒 Изменить время",
+                                   callback_data="menu:rewrite_time"),
         types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"),
     )
     return kb
 
 
 def channels_picker_kb(user_id: int, action: str):
-    """Список каналов пользователя с callback вида action:chat_id."""
     rows = db_get_channels(user_id)
     kb = types.InlineKeyboardMarkup(row_width=1)
     for chat_id, title, username in rows:
         label = f"📢 {title}" + (f" ({username})" if username else "")
-        kb.add(types.InlineKeyboardButton(label, callback_data=f"{action}:{chat_id}"))
+        kb.add(types.InlineKeyboardButton(label,
+                                          callback_data=f"{action}:{chat_id}"))
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"))
     return kb
 
@@ -411,6 +448,16 @@ def menu_router(call):
                              reply_markup=main_menu_kb())
         return
 
+    if action == "back":
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text("Главное меню:", chat_id=chat_id,
+                                  message_id=msg_id, reply_markup=main_menu_kb())
+        except Exception:
+            bot.send_message(chat_id, "Главное меню:",
+                             reply_markup=main_menu_kb())
+        return
+
     if action == "help":
         bot.answer_callback_query(call.id)
         bot.send_message(
@@ -468,10 +515,10 @@ def menu_router(call):
         return
 
     if action == "create":
-        # проверим, есть ли привязанные каналы
         chans = db_get_channels(uid)
         if not chans:
-            bot.answer_callback_query(call.id, "Сначала привяжите канал", show_alert=True)
+            bot.answer_callback_query(call.id, "Сначала привяжите канал",
+                                      show_alert=True)
             return
         bot.answer_callback_query(call.id)
         user_states[uid] = {"state": "waiting_channel_choice", "data": {}}
@@ -505,45 +552,4 @@ def menu_router(call):
     if action == "confirm":
         st = user_states.get(uid)
         if not st or st["state"] != "confirming":
-            bot.answer_callback_query(call.id, "Нечего подтверждать")
-            return
-        d = st["data"]
-        post_id = db_add_post(uid, d["channel_id"], d["content_type"],
-                              d.get("text", ""), d.get("file_id"),
-                              d["publish_at"])
-        user_states.pop(uid, None)
-        bot.answer_callback_query(call.id, "Запланировано ✅")
-        try:
-            bot.edit_message_text(
-                f"✅ Пост #{post_id} для канала "
-                f"<b>{d['channel_title']}</b> запланирован на "
-                f"<code>{d['publish_at'].strftime('%d.%m.%Y %H:%M')}</code>",
-                chat_id=chat_id, message_id=msg_id, reply_markup=main_menu_kb()
-            )
-        except Exception:
-            pass
-        log.info(f"Запланирован пост #{post_id} → канал {d['channel_id']}")
-        return
-
-    if action == "rewrite_text":
-        st = user_states.get(uid)
-        if not st or "content_type" not in st.get("data", {}):
-            bot.answer_callback_query(call.id, "Сессия устарела")
-            return
-        st["state"] = "waiting_content"
-        st["data"].pop("content_type", None)
-        st["data"].pop("file_id", None)
-        st["data"].pop("text", None)
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text("✍️ Отправьте новое содержимое поста.",
-                                  chat_id=chat_id, message_id=msg_id,
-                                  reply_markup=cancel_kb())
-        except Exception:
-            pass
-        return
-
-    if action == "rewrite_time":
-        st = user_states.get(uid)
-        if not st or "content_type" not in st.get("data", {}):
-           
+   
