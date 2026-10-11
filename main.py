@@ -189,7 +189,7 @@ def main_keyboard():
 
 def require_owner(message):
     if not is_owner(message.from_user.id):
-        bot.reply_to(message, "Доступ закрыт. Сначала активируйте бота командой /start КОД_АКТИВАЦИИ.")
+        bot.reply_to(message, "Доступ закрыт. Добавьте бота администратором в нужный канал, затем отправьте /start в личном чате.")
         return False
     return True
 
@@ -262,13 +262,14 @@ def start(message):
 @bot.my_chat_member_handler()
 def auto_bind_channel(update):
     chat = update.chat
+    actor = getattr(update, "from_user", None)
+    log.info("Received my_chat_member update: chat_id=%s chat_type=%s status=%s actor_id=%s", getattr(chat, "id", None), getattr(chat, "type", None), getattr(getattr(update, "new_chat_member", None), "status", None), getattr(actor, "id", None))
     if getattr(chat, "type", None) != "channel":
         return
     new_member = getattr(update, "new_chat_member", None)
     status = getattr(new_member, "status", "")
     if status not in ("administrator", "creator"):
         return
-    actor = getattr(update, "from_user", None)
     if actor is None:
         log.warning("Cannot auto-bind channel %s: no adding user in update", chat.id)
         return
@@ -588,4 +589,4 @@ def scheduler_loop():
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True).start()
     log.info("Bot polling started")
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, allowed_updates=["message", "channel_post", "my_chat_member"])
