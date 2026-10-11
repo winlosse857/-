@@ -1,47 +1,39 @@
-# Telegram Channel Scheduler (Railway + Supabase)
+# Telegram Channel Scheduler (Railway + JSON)
 
-A private Telegram bot that schedules text, photo, video, document, animation, and media-group posts to a Telegram channel. It supports one-time and daily recurring publication.
+Приватный Telegram-бот для планирования публикаций в канал: текст, фото, видео, документы, GIF-анимации и альбомы. Поддерживаются разовые и ежедневные публикации. Внешняя база данных не нужна — настройки и очередь хранятся в JSON-файле.
 
-## 1. Create the Telegram bot
-1. In Telegram, open **@BotFather**, run `/newbot`, and copy the token.
-2. Add the bot to your target channel as an administrator. Grant permission to post messages.
-3. For a private channel, the owner can post `/bindchannel` as a separate channel post after the bot is an admin. For a public channel, use `/bind @channelusername` in the bot's private chat.
+## Запуск на Railway
 
-## 2. Set up Supabase
-1. Create a Supabase project.
-2. Open **SQL Editor** and run all of `schema.sql`.
-3. In **Project Settings → API**, copy the Project URL and the `service_role` key. Keep the service-role key secret; only put it in Railway variables.
+1. Этот репозиторий подключён к Railway как worker-сервис.
+2. В Railway добавьте **Volume** и подключите его к сервису по пути `/data`. Без Volume файл может пропасть при пересборке или перезапуске.
+3. В Variables оставьте/задайте:
+   - `BOT_TOKEN` — токен от @BotFather.
+   - `OWNER_SETUP_CODE` — длинный секретный код для первой активации.
+   - `DEFAULT_TIMEZONE` — необязательно, по умолчанию `Europe/Moscow`.
+   - `DATA_FILE` — необязательно, по умолчанию `/data/bot_data.json`.
+   - `POLL_SECONDS` — необязательно, по умолчанию `10`.
+4. Оставьте **одну реплику** сервиса, чтобы не допустить повторных публикаций.
+5. Railway запускает приложение командой из `Procfile`.
 
-## 3. Deploy to Railway
-1. Put these project files in a GitHub repository.
-2. In Railway, create a project and deploy the repository as a worker service.
-3. Set the following service variables:
+## Активация и подключение канала
 
-- `BOT_TOKEN` — token from BotFather
-- `SUPABASE_URL` — Supabase project URL
-- `SUPABASE_SERVICE_ROLE_KEY` — Supabase `service_role` key
-- `OWNER_SETUP_CODE` — a long, random activation code you choose
-- `DEFAULT_TIMEZONE` — optional; defaults to `Europe/Moscow`
+1. Откройте личный чат с ботом и отправьте `/start ВАШ_КОД_АКТИВАЦИИ`.
+2. Добавьте бота администратором канала с разрешением публиковать сообщения.
+3. Для публичного канала отправьте боту `/bind @имя_канала`.
+4. Для приватного канала опубликуйте в канале отдельное сообщение `/bindchannel`. Бот пришлёт уведомление в личный чат.
 
-Railway uses `Procfile` to run `python main.py`. Keep only **one running replica** of this worker to avoid duplicate publication attempts.
+## Планирование
 
-## 4. Activate and connect
-1. Open the bot's private chat and send `/start YOUR_OWNER_SETUP_CODE`.
-2. Add the bot as an administrator to your channel with permission to post.
-3. Public channel: send `/bind @channelusername` to the bot.
-4. Private channel: publish `/bindchannel` as a separate post in the channel. The bot should notify you in private chat.
+- Отправьте `/new` или нажмите **➕ Запланировать**.
+- Пришлите текст или медиа.
+- Укажите дату и время, например `2026-12-31 18:30`.
+- Для ежедневного повтора добавьте `/daily`: `2026-12-31 18:30 /daily`.
+- `/list` показывает ожидающие и неудачные публикации; `/cancel ID` отменяет ожидающую публикацию.
+- `/timezone Europe/Berlin` меняет часовой пояс.
 
-## 5. Schedule posts
-- Send `/new` or tap **➕ Запланировать**.
-- Send the text, photo, video, document, or animation.
-- Enter the date/time, e.g. `2026-12-31 18:30`.
-- Add `/daily` to the end to repeat daily, e.g. `2026-12-31 18:30 /daily`.
-- `/list` shows pending/failed posts; `/cancel ID` cancels a pending post.
-- `/timezone Europe/Berlin` changes the timezone used to interpret entered dates.
+## Важно
 
-## Notes and limitations
-- Telegram's Bot API does not provide a general API to list all channels owned by a person. This project uses explicit channel binding and checks bot permissions.
-- The chat flow supports text, photos, videos, documents, animations, and photo/video albums (up to 10 items).
-- Daily recurrence advances by 24 hours in UTC. For time zones that change daylight saving time, a future improvement is to calculate the next occurrence in local wall-clock time.
-- Delivery cannot be made exactly-once in the face of network failures: if Telegram accepts a post but the process crashes before Supabase is updated, retrying may duplicate it. Review failed posts before rescheduling.
-- If the bot cannot DM you, open its private chat and press Start.
+- Для сохранения данных между деплоями необходим Railway Volume, смонтированный в `/data`.
+- Держите одну реплику worker-сервиса.
+- Telegram не предоставляет универсальный API для списка всех каналов владельца, поэтому канал подключается вручную.
+- Ежедневный повтор сейчас сдвигается на 24 часа в UTC; переходы на летнее/зимнее время могут влиять на локальное время публикации.
