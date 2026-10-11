@@ -552,4 +552,3 @@ def menu_router(call):
     if action == "confirm":
         st = user_states.get(uid)
         if not st or st["state"] != "confirming":
-   
