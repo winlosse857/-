@@ -8,22 +8,134 @@ from zoneinfo import ZoneInfo
 
 import telebot
 from telebot import types
-from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("scheduler-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 OWNER_SETUP_CODE = os.environ["OWNER_SETUP_CODE"]
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
-db: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+db = JsonStore(DATA_FILE)
 
-# Simple per-user conversation state; durable scheduled posts are stored in Supabase.
+
+# Small JSON-backed replacement for the Supabase query calls used below.
+# Set DATA_FILE to a path on a Railway Volume (recommended: /data/bot_data.json).
+class JsonResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class JsonQuery:
+    def __init__(self, store, table, operation="select", payload=None):
+        self.store, self.table, self.operation, self.payload = store, table, operation, payload
+        self.filters, self.sort_key, self.sort_desc, self.max_rows = [], None, False, None
+
+    def select(self, *_args):
+        self.operation = "select"
+        return self
+
+    def insert(self, payload):
+        self.operation, self.payload = "insert", payload
+        return self
+
+    def update(self, payload):
+        self.operation, self.payload = "update", payload
+        return self
+
+    def eq(self, key, value):
+        self.filters.append(("eq", key, value))
+        return self
+
+    def in_(self, key, values):
+        self.filters.append(("in", key, values))
+        return self
+
+    def lte(self, key, value):
+        self.filters.append(("lte", key, value))
+        return self
+
+    def order(self, key, desc=False):
+        self.sort_key, self.sort_desc = key, desc
+        return self
+
+    def limit(self, count):
+        self.max_rows = count
+        return self
+
+    def _matches(self, row):
+        for op, key, value in self.filters:
+            current = row.get(key)
+            if op == "eq" and str(current) != str(value):
+                return False
+            if op == "in" and current not in value:
+                return False
+            if op == "lte" and (current is None or str(current) > str(value)):
+                return False
+        return True
+
+    def execute(self):
+        with self.store.lock:
+            rows = self.store.data.setdefault(self.table, [])
+            if self.operation == "insert":
+                incoming = self.payload if isinstance(self.payload, list) else [self.payload]
+                inserted = []
+                for source in incoming:
+                    row = dict(source)
+                    if self.table == "scheduled_posts" and not row.get("id"):
+                        row["id"] = max([int(r.get("id", 0)) for r in rows] + [0]) + 1
+                    if self.table == "bot_settings" and any(r.get("id") == row.get("id") for r in rows):
+                        continue
+                    rows.append(row)
+                    inserted.append(dict(row))
+                self.store._save()
+                return JsonResult(inserted)
+            matched = [row for row in rows if self._matches(row)]
+            if self.operation == "update":
+                changed = []
+                for row in matched:
+                    row.update(self.payload or {})
+                    changed.append(dict(row))
+                if changed:
+                    self.store._save()
+                return JsonResult(changed)
+            result = [dict(row) for row in matched]
+            if self.sort_key:
+                result.sort(key=lambda row: row.get(self.sort_key) or "", reverse=self.sort_desc)
+            if self.max_rows is not None:
+                result = result[:self.max_rows]
+            return JsonResult(result)
+
+
+class JsonStore:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.data = {"bot_settings": [], "scheduled_posts": []}
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+        except FileNotFoundError:
+            self._save()
+
+    def _save(self):
+        temporary = self.path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(self.data, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, self.path)
+
+    def table(self, name):
+        return JsonQuery(self, name)
+
+# Conversation state is temporary; scheduled posts and settings are stored in JSON.
 sessions = {}
 session_lock = threading.Lock()
 album_buffers = {}
@@ -342,7 +454,7 @@ def handle_content(message):
             bot.reply_to(message, "Не понял дату. Формат: 2026-12-31 18:30 (и необязательно /daily).")
         except Exception:
             log.exception("Could not schedule post")
-            bot.reply_to(message, "Не удалось сохранить публикацию. Проверьте настройки Supabase и логи Railway.")
+            bot.reply_to(message, "Не удалось сохранить публикацию. Проверьте логи Railway и доступность файла данных.")
 
 
 def flush_album(group_key):
