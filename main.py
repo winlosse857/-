@@ -1,505 +1,479 @@
-import os
-import time
 import json
-import threading
 import logging
+import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import requests
 import telebot
-from telebot import types, apihelper
+from telebot import apihelper, types
 
-# Mechagram uses a custom Bot API server, not api.telegram.org.
-SERVER_URL = "http://177.3.213.27:8081"
+# Mechagram uses its own Bot API server.
+SERVER_URL = os.getenv("SERVER_URL", "http://177.3.213.27:8081").rstrip("/")
 apihelper.API_URL = f"{SERVER_URL}/bot{{0}}/{{1}}"
 apihelper.FILE_URL = f"{SERVER_URL}/file/bot{{0}}/{{1}}"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("scheduler-bot")
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+if not SUPABASE_KEY:
+    raise RuntimeError("Set SUPABASE_SERVICE_ROLE_KEY in Railway variables.")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
-DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
+POLL_SECONDS = max(2, int(os.getenv("POLL_SECONDS", "10")))
+SCHEDULER_SECONDS = max(2, int(os.getenv("SCHEDULER_SECONDS", "5")))
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("mechagram")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None, threaded=True)
 
+class Store:
+    """Small, explicit PostgREST adapter. All database access stays server-side."""
+    def __init__(self, url, key):
+        self.base = url + "/rest/v1"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "apikey": key,
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
 
-# Small JSON-backed replacement for the Supabase query calls used below.
-# Set DATA_FILE to a path on a Railway Volume (recommended: /data/bot_data.json).
-class JsonResult:
-    def __init__(self, data):
-        self.data = data
-
-
-class JsonQuery:
-    def __init__(self, store, table, operation="select", payload=None):
-        self.store, self.table, self.operation, self.payload = store, table, operation, payload
-        self.filters, self.sort_key, self.sort_desc, self.max_rows = [], None, False, None
-
-    def select(self, *_args):
-        self.operation = "select"
-        return self
-
-    def insert(self, payload):
-        self.operation, self.payload = "insert", payload
-        return self
-
-    def update(self, payload):
-        self.operation, self.payload = "update", payload
-        return self
-
-    def eq(self, key, value):
-        self.filters.append(("eq", key, value))
-        return self
-
-    def in_(self, key, values):
-        self.filters.append(("in", key, values))
-        return self
-
-    def lte(self, key, value):
-        self.filters.append(("lte", key, value))
-        return self
-
-    def order(self, key, desc=False):
-        self.sort_key, self.sort_desc = key, desc
-        return self
-
-    def limit(self, count):
-        self.max_rows = count
-        return self
-
-    def _matches(self, row):
-        for op, key, value in self.filters:
-            current = row.get(key)
-            if op == "eq" and str(current) != str(value):
-                return False
-            if op == "in" and current not in value:
-                return False
-            if op == "lte" and (current is None or str(current) > str(value)):
-                return False
-        return True
-
-    def execute(self):
-        with self.store.lock:
-            rows = self.store.data.setdefault(self.table, [])
-            if self.operation == "insert":
-                incoming = self.payload if isinstance(self.payload, list) else [self.payload]
-                inserted = []
-                for source in incoming:
-                    row = dict(source)
-                    if self.table == "scheduled_posts" and not row.get("id"):
-                        row["id"] = max([int(r.get("id", 0)) for r in rows] + [0]) + 1
-                    if self.table == "bot_settings" and any(r.get("id") == row.get("id") for r in rows):
-                        continue
-                    rows.append(row)
-                    inserted.append(dict(row))
-                self.store._save()
-                return JsonResult(inserted)
-            matched = [row for row in rows if self._matches(row)]
-            if self.operation == "update":
-                changed = []
-                for row in matched:
-                    row.update(self.payload or {})
-                    changed.append(dict(row))
-                if changed:
-                    self.store._save()
-                return JsonResult(changed)
-            result = [dict(row) for row in matched]
-            if self.sort_key:
-                result.sort(key=lambda row: row.get(self.sort_key) or "", reverse=self.sort_desc)
-            if self.max_rows is not None:
-                result = result[:self.max_rows]
-            return JsonResult(result)
-
-
-class JsonStore:
-    def __init__(self, path):
-        self.path = path
-        self.lock = threading.RLock()
-        self.data = {"bot_settings": [], "scheduled_posts": []}
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+    def request(self, method, path, *, params=None, body=None, prefer=None):
+        headers = {}
+        if prefer:
+            headers["Prefer"] = prefer
+        response = self.session.request(
+            method, self.base + "/" + path, params=params, json=body,
+            headers=headers, timeout=25
+        )
+        if not response.ok:
+            raise RuntimeError(f"Supabase {method} {path} failed ({response.status_code}): {response.text[:500]}")
+        if not response.text:
+            return []
         try:
-            with open(path, "r", encoding="utf-8") as stream:
-                loaded = json.load(stream)
-            if isinstance(loaded, dict):
-                self.data.update(loaded)
-        except FileNotFoundError:
-            self._save()
+            return response.json()
+        except ValueError:
+            return []
 
-    def _save(self):
-        temporary = self.path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(self.data, stream, ensure_ascii=False, indent=2)
-        os.replace(temporary, self.path)
+    def select(self, table, params=None):
+        return self.request("GET", table, params=params or {"select": "*"})
 
-    def table(self, name):
-        return JsonQuery(self, name)
+    def insert(self, table, body, *, upsert=False):
+        prefer = "return=representation"
+        if upsert:
+            prefer += ",resolution=merge-duplicates"
+        return self.request("POST", table, params={"on_conflict": "chat_id"} if upsert else None,
+                            body=body, prefer=prefer)
 
-# Conversation state is temporary; scheduled posts and settings are stored in JSON.
-db = JsonStore(DATA_FILE)
+    def update(self, table, filters, body):
+        params = {"select": "*"}
+        params.update(filters)
+        return self.request("PATCH", table, params=params, body=body, prefer="return=representation")
+
+    def rpc(self, name, body=None):
+        return self.request("POST", "rpc/" + name, body=body or {})
+
+db = Store(SUPABASE_URL, SUPABASE_KEY)
 sessions = {}
-session_lock = threading.Lock()
+sessions_lock = threading.RLock()
 album_buffers = {}
 album_lock = threading.Lock()
 
-
-def utcnow():
+def now_utc():
     return datetime.now(timezone.utc)
 
+def iso(dt):
+    return dt.astimezone(timezone.utc).isoformat()
 
-def settings_row():
-    result = db.table("bot_settings").select("*").limit(1).execute()
-    return result.data[0] if result.data else None
+def parse_local_datetime(value, tz_name):
+    dt = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+    return dt.replace(tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
 
+def local_time(value, tz_name):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.astimezone(ZoneInfo(tz_name)).strftime("%d.%m.%Y %H:%M")
 
-def owner_id():
-    row = settings_row()
-    return int(row["owner_telegram_id"]) if row and row.get("owner_telegram_id") else None
+def get_user(user_id):
+    rows = db.select("mechagram_users", {"select": "*", "telegram_id": f"eq.{int(user_id)}", "limit": "1"})
+    return rows[0] if rows else None
 
+def ensure_user(user_id):
+    user = get_user(user_id)
+    if user:
+        return user
+    rows = db.insert("mechagram_users", {"telegram_id": int(user_id), "timezone": DEFAULT_TIMEZONE})
+    return rows[0] if rows else get_user(user_id)
 
-def is_owner(user_id):
-    return owner_id() == int(user_id)
+def user_timezone(user_id):
+    user = get_user(user_id)
+    return (user or {}).get("timezone") or DEFAULT_TIMEZONE
 
-
-def set_session(user_id, **values):
-    with session_lock:
-        sessions.setdefault(user_id, {}).update(values)
-
+def set_session(user_id, **data):
+    with sessions_lock:
+        sessions[int(user_id)] = {**sessions.get(int(user_id), {}), **data}
 
 def get_session(user_id):
-    with session_lock:
-        return dict(sessions.get(user_id, {}))
-
+    with sessions_lock:
+        return dict(sessions.get(int(user_id), {}))
 
 def clear_session(user_id):
-    with session_lock:
-        sessions.pop(user_id, None)
+    with sessions_lock:
+        sessions.pop(int(user_id), None)
 
+def user_channels(user_id):
+    return db.select("mechagram_channels", {
+        "select": "*", "owner_telegram_id": f"eq.{int(user_id)}", "order": "created_at.asc", "limit": "100"
+    })
+
+def get_channel_for_user(channel_row_id, user_id):
+    rows = db.select("mechagram_channels", {
+        "select": "*", "id": f"eq.{int(channel_row_id)}",
+        "owner_telegram_id": f"eq.{int(user_id)}", "limit": "1"
+    })
+    return rows[0] if rows else None
+
+def bind_channel(user_id, chat_id, title, username=None):
+    ensure_user(user_id)
+    existing = db.select("mechagram_channels", {
+        "select": "*", "chat_id": f"eq.{int(chat_id)}", "limit": "1"
+    })
+    payload = {
+        "owner_telegram_id": int(user_id), "chat_id": int(chat_id),
+        "title": title or "Канал", "username": username
+    }
+    if existing:
+        rows = db.update("mechagram_channels", {"id": f"eq.{existing[0]['id']}"}, payload)
+    else:
+        rows = db.insert("mechagram_channels", payload)
+    return rows[0] if rows else None
 
 def main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("➕ Запланировать", "📋 Мои публикации")
-    kb.row("📣 Подключить канал", "⚙️ Настройки")
+    kb.row("📣 Мои каналы", "⚙️ Настройки")
     return kb
 
-
-def require_owner(message):
-    if not is_owner(message.from_user.id):
-        bot.reply_to(message, "Доступ закрыт. Добавьте бота администратором в нужный канал, затем отправьте /start в личном чате.")
+def require_private(message):
+    if not getattr(message, "from_user", None):
         return False
+    if getattr(message.chat, "type", "private") != "private":
+        return False
+    ensure_user(message.from_user.id)
     return True
 
+def require_admin_of_channel(chat_id, user_id):
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return getattr(member, "status", "") in ("administrator", "creator")
+    except Exception:
+        return False
 
-def parse_local_datetime(value, timezone_name):
-    # Accepted: YYYY-MM-DD HH:MM
-    dt = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
-    return dt.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(timezone.utc)
+def require_bot_admin(chat_id):
+    try:
+        me = bot.get_me()
+        member = bot.get_chat_member(chat_id, me.id)
+        return getattr(member, "status", "") in ("administrator", "creator")
+    except Exception:
+        return False
 
-
-def human_time(value, timezone_name):
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return dt.astimezone(ZoneInfo(timezone_name)).strftime("%d.%m.%Y %H:%M")
-
-
-def save_channel(channel_id, title, username=None):
-    row = settings_row()
-    if not row:
-        raise RuntimeError("Бот ещё не активирован.")
-    db.table("bot_settings").update({
-        "channel_id": str(channel_id),
-        "channel_title": title,
-        "channel_username": username,
-    }).eq("id", row["id"]).execute()
-
-
-def verify_bot_admin(chat_id):
-    me = bot.get_me()
-    member = bot.get_chat_member(chat_id, me.id)
-    status = getattr(member, "status", "")
-    return status in ("administrator", "creator")
-
-
-def verify_user_admin(chat_id, user_id):
-    member = bot.get_chat_member(chat_id, user_id)
-    return getattr(member, "status", "") in ("administrator", "creator")
-
-
-def current_channel():
-    row = settings_row()
-    if row and row.get("channel_id"):
-        return row
-    return None
-
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    current_owner = owner_id()
-    if current_owner is None:
-        bot.reply_to(
-            message,
-            "Привет! Чтобы привязать канал, добавьте меня в него администратором. "
-            "Я подключу канал автоматически — код активации не нужен."
-        )
+def channel_picker(user_id, action="new"):
+    channels = user_channels(user_id)
+    if not channels:
+        bot.send_message(user_id, "Сначала подключите канал: добавьте бота администратором канала. Я привяжу его автоматически.")
         return
-    if not is_owner(message.from_user.id):
-        bot.reply_to(message, "Этот бот закреплён за другим владельцем. Добавьте бота в свой канал, чтобы привязать его к себе.")
-        return
-    row = settings_row() or {}
-    channel = row.get("channel_title") or "не подключён"
+    kb = types.InlineKeyboardMarkup()
+    for ch in channels:
+        kb.add(types.InlineKeyboardButton(
+            text=(ch.get("title") or str(ch["chat_id"]))[:60],
+            callback_data=f"{action}:ch:{ch['id']}"
+        ))
+    bot.send_message(user_id, "Выберите канал для публикации:", reply_markup=kb)
+
+def begin_new_post(user_id, channel):
+    set_session(user_id, step="content", channel_id=channel["id"], content="", media=[], edit_post_id=None)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row("❌ Отмена")
+    bot.send_message(
+        user_id,
+        f"Канал: {channel['title']}\nПришлите текст, фото или видео. Подпись к фото/видео поддерживается; альбомы фото и видео тоже можно отправлять.\nПосле контента укажете время публикации.",
+        reply_markup=kb
+    )
+
+def prompt_datetime(user_id, message):
+    tz_name = user_timezone(user_id)
     bot.reply_to(
         message,
-        f"Привет! Я планировщик публикаций.\\nКанал: {channel}\\n\\n"
-        "/new — создать публикацию\\n/list — список запланированных\\n"
-        "/timezone Europe/Moscow — часовой пояс",
+        f"Когда публиковать? Часовой пояс: {tz_name}\nФормат: ГГГГ-ММ-ДД ЧЧ:ММ\nПример: 2026-12-31 18:30\nДля повтора добавьте /daily или /weekly после времени. Для разовой публикации ничего добавлять не нужно."
+    )
+
+@bot.message_handler(commands=["start", "help"])
+def start(message):
+    if not require_private(message):
+        return
+    channels = user_channels(message.from_user.id)
+    channel_text = "\n".join(f"• {c['title']} (ID {c['id']})" for c in channels) or "пока не подключены"
+    bot.reply_to(
+        message,
+        "Привет! Я Mechagram — планировщик публикаций для нескольких каналов.\n\n"
+        f"Ваши каналы:\n{channel_text}\n\n"
+        "/new — создать публикацию\n/list — список публикаций\n"
+        "/channels — подключённые каналы\n/timezone Europe/Berlin — часовой пояс\n"
+        "/edit ID — изменить публикацию\n/cancel ID — отменить публикацию\n\n"
+        "Добавьте меня администратором канала — он подключится автоматически.",
         reply_markup=main_keyboard()
     )
 
-
 @bot.my_chat_member_handler()
-def auto_bind_channel(update):
-    chat = update.chat
-    actor = getattr(update, "from_user", None)
-    log.info("Received my_chat_member update: chat_id=%s chat_type=%s status=%s actor_id=%s", getattr(chat, "id", None), getattr(chat, "type", None), getattr(getattr(update, "new_chat_member", None), "status", None), getattr(actor, "id", None))
-    if getattr(chat, "type", None) != "channel":
-        return
-    new_member = getattr(update, "new_chat_member", None)
-    status = getattr(new_member, "status", "")
-    if status not in ("administrator", "creator"):
-        return
-    if actor is None:
-        log.warning("Cannot auto-bind channel %s: no adding user in update", chat.id)
-        return
+def on_bot_membership(update):
     try:
-        row = settings_row()
-        payload = {
-            "owner_telegram_id": actor.id,
-            "channel_id": str(chat.id),
-            "channel_title": getattr(chat, "title", "Канал"),
-            "channel_username": getattr(chat, "username", None),
-        }
-        if row:
-            db.table("bot_settings").update(payload).eq("id", row["id"]).execute()
-        else:
-            payload.update({"id": 1, "timezone": DEFAULT_TIMEZONE})
-            db.table("bot_settings").insert(payload).execute()
-        bot.send_message(
-            actor.id,
-            f"Канал «{getattr(chat, 'title', 'Канал')}» привязан автоматически. "
-            "Теперь отправьте /start, чтобы планировать публикации."
-        )
-        log.info("Channel %s auto-bound to user %s", chat.id, actor.id)
+        chat = update.chat
+        actor = getattr(update, "from_user", None)
+        member = getattr(update, "new_chat_member", None)
+        status = getattr(member, "status", "")
+        if getattr(chat, "type", None) != "channel" or status not in ("administrator", "creator") or not actor:
+            return
+        bind_channel(actor.id, chat.id, getattr(chat, "title", "Канал"), getattr(chat, "username", None))
+        try:
+            bot.send_message(actor.id, f"Канал «{getattr(chat, 'title', 'Канал')}» подключён. Отправьте /new, чтобы запланировать публикацию.")
+        except Exception:
+            log.info("Could not DM channel-adder %s; they may need to send /start first", actor.id)
+        log.info("Channel %s bound to user %s", chat.id, actor.id)
     except Exception:
-        log.exception("Automatic channel binding failed")
+        log.exception("Failed to process channel membership update")
 
 @bot.message_handler(commands=["bind"])
-def bind(message):
-    if not require_owner(message):
-        return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Укажите публичный @username канала: /bind @my_channel\nДля приватного канала опубликуйте в нём сообщение с командой /bindchannel после добавления бота администратором.")
-        return
-    target = parts[1].strip()
-    try:
-        chat = bot.get_chat(target)
-        if chat.type != "channel":
-            bot.reply_to(message, "Это не канал Telegram.")
-            return
-        if not verify_user_admin(chat.id, message.from_user.id):
-            bot.reply_to(message, "Ваш аккаунт не распознан как администратор этого канала.")
-            return
-        if not verify_bot_admin(chat.id):
-            bot.reply_to(message, "Сначала добавьте бота администратором канала и повторите команду.")
-            return
-        save_channel(chat.id, getattr(chat, "title", str(target)), getattr(chat, "username", None))
-        bot.reply_to(message, f"Канал подключён: {getattr(chat, 'title', target)}", reply_markup=main_keyboard())
-    except Exception as exc:
-        log.exception("Channel bind failed")
-        bot.reply_to(message, f"Не удалось подключить канал. Проверьте @username и права бота.\nТехническая ошибка: {str(exc)[:250]}")
-
-
-@bot.channel_post_handler(commands=["bindchannel"])
-def bind_from_channel(message):
-    row = settings_row()
-    if not row:
-        return
-    # This command is useful for private channels. The owner must first activate the bot.
-    try:
-        if not verify_bot_admin(message.chat.id):
-            return
-        save_channel(message.chat.id, getattr(message.chat, "title", "Канал"), getattr(message.chat, "username", None))
-        bot.send_message(int(row["owner_telegram_id"]), f"Канал подключён из сообщения в канале: {message.chat.title} ({message.chat.id}).")
-    except Exception:
-        log.exception("Channel-post binding failed")
-
-
-@bot.message_handler(commands=["timezone"])
-def timezone_cmd(message):
-    if not require_owner(message):
+def bind_command(message):
+    if not require_private(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
-        bot.reply_to(message, "Пример: /timezone Europe/Moscow")
+        bot.reply_to(message, "Использование: /bind @channel_username")
+        return
+    try:
+        chat = bot.get_chat(parts[1].strip())
+        if getattr(chat, "type", "") != "channel":
+            bot.reply_to(message, "Это не канал.")
+            return
+        if not require_admin_of_channel(chat.id, message.from_user.id):
+            bot.reply_to(message, "Не удалось подтвердить, что вы администратор канала.")
+            return
+        if not require_bot_admin(chat.id):
+            bot.reply_to(message, "Сначала добавьте бота администратором канала.")
+            return
+        bind_channel(message.from_user.id, chat.id, getattr(chat, "title", parts[1]), getattr(chat, "username", None))
+        bot.reply_to(message, f"Канал «{getattr(chat, 'title', parts[1])}» подключён.", reply_markup=main_keyboard())
+    except Exception:
+        log.exception("Manual channel binding failed")
+        bot.reply_to(message, "Не удалось подключить канал. Проверьте @username и права бота.")
+
+@bot.message_handler(commands=["channels"])
+@bot.message_handler(func=lambda m: m.text == "📣 Мои каналы")
+def channels_command(message):
+    if not require_private(message):
+        return
+    channels = user_channels(message.from_user.id)
+    if not channels:
+        bot.reply_to(message, "Каналов пока нет. Добавьте бота администратором в канал или используйте /bind @username.")
+        return
+    lines = ["Ваши каналы:"]
+    for ch in channels:
+        username = f" · @{ch['username']}" if ch.get("username") else ""
+        lines.append(f"• {ch['title']}{username} · ID {ch['id']}")
+    bot.reply_to(message, "\n".join(lines), reply_markup=main_keyboard())
+
+@bot.message_handler(commands=["timezone"])
+def timezone_command(message):
+    if not require_private(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        bot.reply_to(message, "Пример: /timezone Europe/Berlin")
         return
     try:
         ZoneInfo(parts[1].strip())
-        row = settings_row()
-        db.table("bot_settings").update({"timezone": parts[1].strip()}).eq("id", row["id"]).execute()
-        bot.reply_to(message, f"Часовой пояс установлен: {parts[1].strip()}")
+        rows = db.update("mechagram_users", {"telegram_id": f"eq.{message.from_user.id}"}, {"timezone": parts[1].strip(), "updated_at": iso(now_utc())})
+        if rows:
+            bot.reply_to(message, f"Часовой пояс установлен: {parts[1].strip()}")
+        else:
+            bot.reply_to(message, "Не удалось сохранить часовой пояс. Отправьте /start и повторите.")
     except Exception:
-        bot.reply_to(message, "Неизвестный часовой пояс. Используйте, например, Europe/Moscow или Europe/Berlin.")
-
+        bot.reply_to(message, "Неизвестный часовой пояс. Пример: Europe/Moscow или Europe/Berlin.")
 
 @bot.message_handler(commands=["new"])
-def new_post(message):
-    if not require_owner(message):
-        return
-    if not current_channel():
-        bot.reply_to(message, "Сначала подключите канал: /bind @username")
-        return
-    set_session(message.from_user.id, step="content", media=[])
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.row("❌ Отмена")
-    bot.reply_to(message, "Пришлите текст, фото или видео для публикации. Для альбома отправьте несколько фото/видео одним альбомом. Подпись к медиа поддерживается.", reply_markup=kb)
-
-
 @bot.message_handler(func=lambda m: m.text == "➕ Запланировать")
-def new_post_button(message):
-    new_post(message)
-
+def new_command(message):
+    if not require_private(message):
+        return
+    clear_session(message.from_user.id)
+    channel_picker(message.from_user.id, "new")
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отмена")
-def cancel(message):
+def cancel_flow(message):
+    if not require_private(message):
+        return
     clear_session(message.from_user.id)
     bot.reply_to(message, "Действие отменено.", reply_markup=main_keyboard())
 
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    try:
+        data = call.data or ""
+        user_id = call.from_user.id
+        ensure_user(user_id)
+        if data.startswith("new:ch:") or data.startswith("edit:ch:"):
+            action, _, channel_id = data.split(":", 2)
+            channel = get_channel_for_user(channel_id, user_id)
+            if not channel:
+                bot.answer_callback_query(call.id, "Канал не найден или нет доступа.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "Канал выбран.")
+            if action == "new":
+                begin_new_post(user_id, channel)
+            else:
+                session = get_session(user_id)
+                post = session.get("edit_post")
+                if not post:
+                    bot.send_message(user_id, "Сессия редактирования истекла. Повторите /edit ID.")
+                    return
+                set_session(user_id, step="content", channel_id=channel["id"], content="", media=[], edit_post_id=post["id"])
+                bot.send_message(user_id, "Пришлите новый текст, фото или видео для публикации. Затем укажите новое время.")
+            return
+        if data.startswith("post:"):
+            _, action, post_id = data.split(":", 2)
+            rows = db.select("mechagram_posts", {
+                "select": "*", "id": f"eq.{int(post_id)}",
+                "owner_telegram_id": f"eq.{user_id}", "limit": "1"
+            })
+            if not rows:
+                bot.answer_callback_query(call.id, "Публикация не найдена.", show_alert=True)
+                return
+            post = rows[0]
+            if action == "cancel":
+                changed = db.update("mechagram_posts", {
+                    "id": f"eq.{post['id']}", "owner_telegram_id": f"eq.{user_id}",
+                    "status": "eq.pending"
+                }, {"status": "cancelled", "updated_at": iso(now_utc())})
+                bot.answer_callback_query(call.id, "Публикация отменена." if changed else "Уже отправлена или отменена.", show_alert=not bool(changed))
+            elif action == "edit":
+                if post["status"] != "pending":
+                    bot.answer_callback_query(call.id, "Редактировать можно только ожидающие публикации.", show_alert=True)
+                    return
+                set_session(user_id, step="choose_edit_channel", edit_post=post)
+                bot.answer_callback_query(call.id, "Выберите канал.")
+                channel_picker(user_id, "edit")
+            return
+        bot.answer_callback_query(call.id, "Неизвестное действие.", show_alert=True)
+    except Exception:
+        log.exception("Callback failed")
+        try:
+            bot.answer_callback_query(call.id, "Не удалось выполнить действие.", show_alert=True)
+        except Exception:
+            pass
 
 @bot.message_handler(commands=["list"])
 @bot.message_handler(func=lambda m: m.text == "📋 Мои публикации")
-def list_posts(message):
-    if not require_owner(message):
+def list_command(message):
+    if not require_private(message):
         return
-    row = settings_row()
-    result = db.table("scheduled_posts").select("*").eq("owner_telegram_id", message.from_user.id).in_("status", ["pending", "failed"]).order("publish_at").limit(20).execute()
-    posts = result.data or []
+    posts = db.select("mechagram_posts", {
+        "select": "*,mechagram_channels(title)",
+        "owner_telegram_id": f"eq.{message.from_user.id}",
+        "status": "in.(pending,failed)", "order": "scheduled_at.asc", "limit": "30"
+    })
     if not posts:
         bot.reply_to(message, "Запланированных публикаций нет.", reply_markup=main_keyboard())
         return
-    lines = ["Ваши публикации:"]
-    for p in posts:
-        lines.append(f"#{p['id']} · {human_time(p['publish_at'], row['timezone'])} · {p['status']} · {p['content'][:55].replace(chr(10), ' ')}")
-    lines.append("\nОтменить: /cancel ID")
-    bot.reply_to(message, "\n".join(lines), reply_markup=main_keyboard())
-
+    tz_name = user_timezone(message.from_user.id)
+    for post in posts:
+        channel = post.get("mechagram_channels") or {}
+        title = channel.get("title", "Канал")
+        text = post.get("text_content") or {"photo": "📷 Фото", "video": "🎬 Видео", "album": "🖼 Альбом"}.get(post.get("content_type"), "Текст")
+        body = (f"Публикация #{post['id']}\nКанал: {title}\n"
+                f"Время: {local_time(post['scheduled_at'], tz_name)}\n"
+                f"Повтор: {post.get('recurrence', 'once')}\nСтатус: {post['status']}\n"
+                f"Содержание: {text[:300]}")
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton("✏️ Изменить", callback_data=f"post:edit:{post['id']}"),
+            types.InlineKeyboardButton("❌ Отменить", callback_data=f"post:cancel:{post['id']}")
+        )
+        bot.send_message(message.chat.id, body, reply_markup=kb)
+    bot.send_message(message.chat.id, "Конец списка.", reply_markup=main_keyboard())
 
 @bot.message_handler(commands=["cancel"])
-def cancel_post(message):
-    if not require_owner(message):
+def cancel_post_command(message):
+    if not require_private(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].isdigit():
         bot.reply_to(message, "Использование: /cancel ID")
         return
-    result = db.table("scheduled_posts").update({"status": "cancelled"}).eq("id", int(parts[1])).eq("owner_telegram_id", message.from_user.id).eq("status", "pending").execute()
-    bot.reply_to(message, "Публикация отменена." if result.data else "Не найдено ожидающей публикации с таким ID.")
+    changed = db.update("mechagram_posts", {
+        "id": f"eq.{int(parts[1])}", "owner_telegram_id": f"eq.{message.from_user.id}",
+        "status": "eq.pending"
+    }, {"status": "cancelled", "updated_at": iso(now_utc())})
+    bot.reply_to(message, "Публикация отменена." if changed else "Ожидающая публикация с таким ID не найдена.", reply_markup=main_keyboard())
 
-
-@bot.message_handler(func=lambda m: m.text == "📣 Подключить канал")
-def connect_help(message):
-    if not require_owner(message):
+@bot.message_handler(commands=["edit"])
+def edit_post_command(message):
+    if not require_private(message):
         return
-    bot.reply_to(message, "Публичный канал: отправьте /bind @username в личном чате с ботом.\nПриватный канал: добавьте бота администратором и опубликуйте в канале отдельное сообщение /bindchannel. Бот сообщит вам, когда канал подключён.")
-
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.reply_to(message, "Использование: /edit ID")
+        return
+    rows = db.select("mechagram_posts", {
+        "select": "*", "id": f"eq.{int(parts[1])}",
+        "owner_telegram_id": f"eq.{message.from_user.id}", "status": "eq.pending", "limit": "1"
+    })
+    if not rows:
+        bot.reply_to(message, "Ожидающая публикация не найдена.")
+        return
+    set_session(message.from_user.id, step="choose_edit_channel", edit_post=rows[0])
+    channel_picker(message.from_user.id, "edit")
 
 @bot.message_handler(func=lambda m: m.text == "⚙️ Настройки")
-def settings(message):
-    if not require_owner(message):
+def settings_command(message):
+    if not require_private(message):
         return
-    row = settings_row()
-    channel = row.get("channel_title") or "не подключён"
-    bot.reply_to(message, f"Канал: {channel}\nЧасовой пояс: {row['timezone']}\n\nИзменить часовой пояс: /timezone Europe/Berlin")
+    bot.reply_to(message, f"Часовой пояс: {user_timezone(message.from_user.id)}\nИзменить: /timezone Europe/Berlin\nДобавить канал: добавьте бота администратором в канал или /bind @username", reply_markup=main_keyboard())
 
-
-def finish_content(message, content, media):
-    user_id = message.from_user.id
-    set_session(user_id, step="datetime", content=content, media=media)
-    row = settings_row()
-    bot.reply_to(message, f"Когда публиковать? Введите дату и время в часовом поясе {row['timezone']}.\nФормат: ГГГГ-ММ-ДД ЧЧ:ММ\nНапример: 2026-12-31 18:30\n\nДля ежедневной публикации добавьте /daily после даты: 2026-12-31 18:30 /daily")
-
-
-@bot.message_handler(content_types=["text", "photo", "video", "document", "animation"])
-def handle_content(message):
-    if message.from_user is None or not is_owner(message.from_user.id):
+def save_content_from_message(message, session):
+    media = list(session.get("media") or [])
+    caption = session.get("content") or ""
+    if message.media_group_id:
+        key = (message.from_user.id, str(message.media_group_id))
+        with album_lock:
+            entry = album_buffers.setdefault(key, {"messages": [], "timer": None, "session": session})
+            entry["messages"].append(message)
+            if entry["timer"]:
+                entry["timer"].cancel()
+            entry["timer"] = threading.Timer(1.4, flush_album, args=(key,))
+            entry["timer"].daemon = True
+            entry["timer"].start()
         return
-    if message.text and message.text.startswith("/"):
+    if message.text is not None:
+        caption = message.text
+    elif message.photo:
+        media = [{"type": "photo", "file_id": message.photo[-1].file_id}]
+        caption = message.caption or ""
+    elif message.video:
+        media = [{"type": "video", "file_id": message.video.file_id}]
+        caption = message.caption or ""
+    else:
         return
-    session = get_session(message.from_user.id)
-    if not session:
-        return
-    if session.get("step") == "content":
-        if message.media_group_id:
-            group_key = (message.from_user.id, str(message.media_group_id))
-            with album_lock:
-                entry = album_buffers.setdefault(group_key, {"messages": [], "timer": None})
-                entry["messages"].append(message)
-                if entry["timer"]:
-                    entry["timer"].cancel()
-                entry["timer"] = threading.Timer(1.5, flush_album, args=(group_key,))
-                entry["timer"].daemon = True
-                entry["timer"].start()
-            return
-        if message.text:
-            finish_content(message, message.text, [])
-        elif message.photo:
-            media = [{"type": "photo", "file_id": message.photo[-1].file_id, "caption": message.caption or ""}]
-            finish_content(message, message.caption or "[Фото]", media)
-        elif message.video:
-            media = [{"type": "video", "file_id": message.video.file_id, "caption": message.caption or ""}]
-            finish_content(message, message.caption or "[Видео]", media)
-        elif message.document:
-            media = [{"type": "document", "file_id": message.document.file_id, "caption": message.caption or ""}]
-            finish_content(message, message.caption or "[Файл]", media)
-        elif message.animation:
-            media = [{"type": "animation", "file_id": message.animation.file_id, "caption": message.caption or ""}]
-            finish_content(message, message.caption or "[Анимация]", media)
-    elif session.get("step") == "datetime" and message.text:
-        row = settings_row()
-        daily = "/daily" in message.text.lower()
-        cleaned = re.sub(r"(?i)\s*/daily\b", "", message.text).strip()
-        try:
-            publish_at = parse_local_datetime(cleaned, row["timezone"])
-            if publish_at <= utcnow():
-                bot.reply_to(message, "Это время уже прошло. Введите будущую дату и время.")
-                return
-            db.table("scheduled_posts").insert({
-                "owner_telegram_id": message.from_user.id,
-                "channel_id": str(row["channel_id"]),
-                "content": session["content"],
-                "media": session.get("media", []),
-                "publish_at": publish_at.isoformat(),
-                "recurrence": "daily" if daily else "once",
-                "status": "pending"
-            }).execute()
-            clear_session(message.from_user.id)
-            bot.reply_to(message, "Публикация запланирована" + (" ежедневно." if daily else "."), reply_markup=main_keyboard())
-        except ValueError:
-            bot.reply_to(message, "Не понял дату. Формат: 2026-12-31 18:30 (и необязательно /daily).")
-        except Exception:
-            log.exception("Could not schedule post")
-            bot.reply_to(message, "Не удалось сохранить публикацию. Проверьте логи Railway и доступность файла данных.")
+    set_session(message.from_user.id, step="datetime", content=caption, media=media)
+    prompt_datetime(message.from_user.id, message)
 
-
-def flush_album(group_key):
+def flush_album(key):
     with album_lock:
-        entry = album_buffers.pop(group_key, None)
-    if not entry or not entry["messages"]:
+        entry = album_buffers.pop(key, None)
+    if not entry:
         return
     messages = sorted(entry["messages"], key=lambda m: m.message_id)
-    first = messages[0]
     media = []
     caption = ""
     for msg in messages:
@@ -510,83 +484,152 @@ def flush_album(group_key):
         elif msg.video:
             media.append({"type": "video", "file_id": msg.video.file_id, "caption": msg.caption or ""})
     if not media:
-        bot.reply_to(first, "Не удалось распознать элементы альбома. Попробуйте отправить фото/видео ещё раз.")
         return
-    finish_content(first, caption or "[Альбом]", media[:10])
+    user_id = messages[0].from_user.id
+    set_session(user_id, step="datetime", content=caption, media=media[:10])
+    bot.send_message(user_id, f"Когда публиковать? Часовой пояс: {user_timezone(user_id)}\nФормат: ГГГГ-ММ-ДД ЧЧ:ММ\nДобавьте /daily или /weekly для повтора.")
 
+@bot.message_handler(content_types=["text", "photo", "video"])
+def content_handler(message):
+    if not require_private(message):
+        return
+    text = message.text or ""
+    if text.startswith("/"):
+        return
+    if text == "❌ Отмена":
+        return
+    session = get_session(message.from_user.id)
+    if not session:
+        return
+    if session.get("step") == "content":
+        save_content_from_message(message, session)
+        return
+    if session.get("step") != "datetime" or not message.text:
+        return
+    raw = message.text.strip()
+    recurrence = "daily" if re.search(r"(?i)\s*/daily\b", raw) else ("weekly" if re.search(r"(?i)\s*/weekly\b", raw) else "once")
+    cleaned = re.sub(r"(?i)\s*/(?:daily|weekly)\b", "", raw).strip()
+    try:
+        scheduled_at = parse_local_datetime(cleaned, user_timezone(message.from_user.id))
+        if scheduled_at <= now_utc():
+            bot.reply_to(message, "Это время уже прошло. Введите будущую дату и время.")
+            return
+        channel = get_channel_for_user(session["channel_id"], message.from_user.id)
+        if not channel:
+            clear_session(message.from_user.id)
+            bot.reply_to(message, "Канал не найден. Начните заново с /new.")
+            return
+        edit_id = session.get("edit_post_id")
+        content_type = "album" if len(session.get("media") or []) > 1 else ((session.get("media") or [{}])[0].get("type", "text"))
+        payload = {
+            "owner_telegram_id": message.from_user.id, "channel_id": channel["id"],
+            "content_type": content_type, "text_content": session.get("content") or "",
+            "media": session.get("media") or [], "scheduled_at": iso(scheduled_at),
+            "recurrence": recurrence, "status": "pending", "error_message": None,
+            "updated_at": iso(now_utc())
+        }
+        if edit_id:
+            changed = db.update("mechagram_posts", {
+                "id": f"eq.{int(edit_id)}", "owner_telegram_id": f"eq.{message.from_user.id}",
+                "status": "eq.pending"
+            }, {k: v for k, v in payload.items() if k not in ("owner_telegram_id", "channel_id")})
+            if not changed:
+                bot.reply_to(message, "Публикация уже не ожидает отправки, изменения не сохранены.")
+            else:
+                bot.reply_to(message, f"Публикация #{edit_id} обновлена.", reply_markup=main_keyboard())
+        else:
+            rows = db.insert("mechagram_posts", payload)
+            bot.reply_to(message, f"Публикация #{rows[0]['id']} запланирована." if rows else "Публикация сохранена.", reply_markup=main_keyboard())
+        clear_session(message.from_user.id)
+    except ValueError:
+        bot.reply_to(message, "Не понял дату. Формат: 2026-12-31 18:30, необязательно с /daily или /weekly.")
+    except Exception:
+        log.exception("Could not save scheduled post")
+        bot.reply_to(message, "Не удалось сохранить публикацию. Проверьте подключение к базе и повторите.")
 
 def publish_post(post):
-    channel_id = post["channel_id"]
+    channel = db.select("mechagram_channels", {"select": "*", "id": f"eq.{post['channel_id']}", "limit": "1"})
+    if not channel:
+        raise RuntimeError("Канал удалён или больше не подключён.")
+    chat_id = int(channel[0]["chat_id"])
+    content = post.get("text_content") or ""
     media = post.get("media") or []
-    if len(media) == 1:
-        item = media[0]
-        caption = item.get("caption") or post["content"]
-        if item["type"] == "photo":
-            bot.send_photo(channel_id, item["file_id"], caption=caption)
-        elif item["type"] == "video":
-            bot.send_video(channel_id, item["file_id"], caption=caption)
-        elif item["type"] == "document":
-            bot.send_document(channel_id, item["file_id"], caption=caption)
-        elif item["type"] == "animation":
-            bot.send_animation(channel_id, item["file_id"], caption=caption)
-        else:
-            bot.send_message(channel_id, post["content"])
-    elif len(media) > 1:
-        group = []
-        for i, item in enumerate(media[:10]):
-            caption = item.get("caption", "") if i == 0 else None
-            if item["type"] == "photo":
-                group.append(types.InputMediaPhoto(item["file_id"], caption=caption))
-            elif item["type"] == "video":
-                group.append(types.InputMediaVideo(item["file_id"], caption=caption))
-        if group:
-            bot.send_media_group(channel_id, group)
-        else:
-            bot.send_message(channel_id, post["content"])
+    if not media:
+        bot.send_message(chat_id, content)
+    elif len(media) == 1 and media[0]["type"] == "photo":
+        kwargs = {"chat_id": chat_id, "photo": media[0]["file_id"]}
+        if content:
+            kwargs["caption"] = content
+        bot.send_photo(**kwargs)
+    elif len(media) == 1 and media[0]["type"] == "video":
+        kwargs = {"chat_id": chat_id, "video": media[0]["file_id"]}
+        if content:
+            kwargs["caption"] = content
+        bot.send_video(**kwargs)
     else:
-        bot.send_message(channel_id, post["content"])
-
+        group = []
+        for index, item in enumerate(media[:10]):
+            caption = content if index == 0 else None
+            if item["type"] == "photo":
+                group.append(types.InputMediaPhoto(media=item["file_id"], caption=caption))
+            elif item["type"] == "video":
+                group.append(types.InputMediaVideo(media=item["file_id"], caption=caption))
+        if group:
+            bot.send_media_group(chat_id, group)
+        else:
+            bot.send_message(chat_id, content)
 
 def scheduler_loop():
+    log.info("Scheduler started; polling every %s seconds", SCHEDULER_SECONDS)
     while True:
         try:
-            due = db.table("scheduled_posts").select("*").eq("status", "pending").lte("publish_at", utcnow().isoformat()).order("publish_at").limit(10).execute().data or []
-            for post in due:
-                # Conditional update is a best-effort claim. Run a single Railway replica to avoid duplicate delivery.
-                claim = db.table("scheduled_posts").update({"status": "publishing"}).eq("id", post["id"]).eq("status", "pending").execute()
-                if not claim.data:
-                    continue
+            # Recover jobs abandoned by a process restart, without touching recent claims.
+            stale = (now_utc() - timedelta(minutes=10)).isoformat()
+            db.update("mechagram_posts", {
+                "status": "eq.sending", "updated_at": f"lt.{stale}"
+            }, {"status": "pending", "updated_at": iso(now_utc())})
+            posts = db.rpc("mechagram_claim_due_posts")
+            for post in posts or []:
                 try:
                     publish_post(post)
-                    if post.get("recurrence") == "daily":
-                        settings = settings_row() or {}
-                        timezone_name = settings.get("timezone", DEFAULT_TIMEZONE)
-                        published_utc = datetime.fromisoformat(post["publish_at"].replace("Z", "+00:00"))
-                        published_local = published_utc.astimezone(ZoneInfo(timezone_name))
-                        next_local = (published_local.replace(tzinfo=None) + timedelta(days=1)).replace(tzinfo=ZoneInfo(timezone_name))
-                        next_time = next_local.astimezone(timezone.utc)
-                        db.table("scheduled_posts").update({
-                            "status": "pending", "publish_at": next_time.isoformat(),
-                            "published_at": utcnow().isoformat(), "error": None
-                        }).eq("id", post["id"]).execute()
+                    recurrence = post.get("recurrence", "once")
+                    if recurrence in ("daily", "weekly"):
+                        tz_name = user_timezone(post["owner_telegram_id"])
+                        local_dt = datetime.fromisoformat(post["scheduled_at"].replace("Z", "+00:00")).astimezone(ZoneInfo(tz_name))
+                        next_local = local_dt + timedelta(days=1 if recurrence == "daily" else 7)
+                        db.update("mechagram_posts", {"id": f"eq.{post['id']}", "status": "eq.sending"}, {
+                            "status": "pending", "scheduled_at": iso(next_local), "sent_at": iso(now_utc()),
+                            "error_message": None, "updated_at": iso(now_utc())
+                        })
                     else:
-                        db.table("scheduled_posts").update({
-                            "status": "published", "published_at": utcnow().isoformat(), "error": None
-                        }).eq("id", post["id"]).execute()
-                    bot.send_message(int(post["owner_telegram_id"]), f"Публикация #{post['id']} отправлена в канал.")
+                        db.update("mechagram_posts", {"id": f"eq.{post['id']}", "status": "eq.sending"}, {
+                            "status": "sent", "sent_at": iso(now_utc()), "error_message": None,
+                            "updated_at": iso(now_utc())
+                        })
+                    log.info("Published scheduled post id=%s", post["id"])
                 except Exception as exc:
-                    log.exception("Publishing post %s failed", post["id"])
-                    db.table("scheduled_posts").update({"status": "failed", "error": str(exc)[:1000]}).eq("id", post["id"]).execute()
+                    log.exception("Publishing post id=%s failed", post.get("id"))
+                    db.update("mechagram_posts", {"id": f"eq.{post['id']}", "status": "eq.sending"}, {
+                        "status": "failed", "error_message": str(exc)[:1000], "updated_at": iso(now_utc())
+                    })
                     try:
-                        bot.send_message(int(post["owner_telegram_id"]), f"Не удалось опубликовать #{post['id']}: {str(exc)[:300]}\nПроверьте права бота и статус публикации командой /list.")
+                        bot.send_message(int(post["owner_telegram_id"]), f"Не удалось опубликовать #{post['id']}: {str(exc)[:300]}\nИсправьте проблему и создайте публикацию заново.")
                     except Exception:
                         pass
         except Exception:
             log.exception("Scheduler iteration failed")
-        time.sleep(POLL_SECONDS)
+        time.sleep(SCHEDULER_SECONDS)
 
+def main():
+    # Fail fast if credentials, API access, or migrations are incorrect.
+    db.select("mechagram_users", {"select": "telegram_id", "limit": "1"})
+    db.rpc("mechagram_claim_due_posts")
+    threading.Thread(target=scheduler_loop, name="scheduler", daemon=True).start()
+    log.info("Mechagram starting; custom API=%s; Supabase=%s", SERVER_URL, SUPABASE_URL)
+    bot.infinity_polling(
+        timeout=30, long_polling_timeout=25, skip_pending=False,
+        allowed_updates=["message", "channel_post", "my_chat_member", "callback_query"]
+    )
 
 if __name__ == "__main__":
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    log.info("Bot polling started")
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, allowed_updates=["message", "channel_post", "my_chat_member"])
+    main()
