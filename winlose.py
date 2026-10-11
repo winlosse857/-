@@ -19,7 +19,7 @@ apihelper.FILE_URL = f"{SERVER_URL}/file/bot{{0}}/{{1}}"
 
 bot = telebot.TeleBot(TOKEN)
 
-# ============ КОНСТАНТЫ ИГР ============
+# ============ КОНСТАНТЫ ============
 START_BALANCE = 100
 DAILY_BONUS_MIN = 50
 DAILY_BONUS_MAX = 150
@@ -28,6 +28,7 @@ DAILY_COOLDOWN = 24 * 60 * 60
 SLOT_BET = 50
 DICE_BET = 25
 COIN_BET = 10
+
 
 # ============ БАЗА ДАННЫХ ============
 def db_init():
@@ -81,8 +82,9 @@ def db_update_stars(user_id, delta):
     conn.close()
 
 
-def db_try_bet(user_id, bet):
+def db_try_bet(user_id, bet, username=None):
     """Атомарно списывает ставку. True — если хватило баланса, False — если нет."""
+    db_get_user(user_id, username)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
@@ -167,6 +169,71 @@ def coin_choice_menu():
     return kb
 
 
+# ============ ХЕЛПЕРЫ ============
+def safe_edit(chat_id, message_id, text, reply_markup=None):
+    """Пытается отредактировать сообщение, если не выходит — отправляет новое."""
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        return
+    except Exception as e:
+        err = str(e)
+        if "not modified" in err:
+            return
+        print(f"[safe_edit] edit failed: {err}")
+        try:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
+        except Exception as e2:
+            print(f"[safe_edit] send also failed: {e2}")
+
+
+def send_top(chat_id):
+    rows = db_top(10)
+    if not rows:
+        bot.send_message(chat_id, "Пока никто не играл 🤷", reply_markup=back_menu())
+        return
+    lines = ["🏆 <b>Топ игроков:</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (username, user_id, stars) in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"{i+1}."
+        name = f"@{username}" if username else f"id{user_id}"
+        lines.append(f"{prefix} {name} — <b>{stars}</b> ⭐")
+    bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=back_menu())
+
+
+def play_coin(call, user_id, username, player_choice):
+    bet = COIN_BET
+    if not db_try_bet(user_id, bet, username):
+        bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
+        return
+
+    result = random.choice(["Орёл", "Решка"])
+    emoji = "🦅" if result == "Орёл" else "👑"
+
+    if player_choice == result:
+        win = bet * 2
+        db_update_stars(user_id, win)
+        db_update_after_game(user_id, win - bet)
+        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n🎉 Угадал! +{win} ⭐"
+    else:
+        db_update_after_game(user_id, -bet)
+        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n😢 Мимо. -{bet} ⭐"
+
+    new_user = db_get_user(user_id)
+    bot.answer_callback_query(call.id)
+    safe_edit(
+        call.message.chat.id,
+        call.message.message_id,
+        f"{msg}\n\n⭐ Баланс: <b>{new_user['stars']}</b>",
+        after_game_menu()
+    )
+
+
 # ============ КОМАНДЫ ============
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
@@ -212,47 +279,12 @@ def cmd_help(message):
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=back_menu())
 
 
-# ============ ХЕЛПЕРЫ ============
-def safe_edit(chat_id, message_id, text, reply_markup=None):
-    """Пытается отредактировать сообщение, если не выходит — отправляет новое."""
-    try:
-        bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        # "message is not modified" — не страшно, просто игнорируем
-        if "not modified" in str(e):
-            return
-        # иначе пробуем отправить новое
-        try:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
-        except Exception:
-            pass
-
-
-def send_top(chat_id):
-    rows = db_top(10)
-    if not rows:
-        bot.send_message(chat_id, "Пока никто не играл 🤷", reply_markup=back_menu())
-        return
-    lines = ["🏆 <b>Топ игроков:</b>\n"]
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (username, user_id, stars) in enumerate(rows):
-        prefix = medals[i] if i < 3 else f"{i+1}."
-        name = f"@{username}" if username else f"id{user_id}"
-        lines.append(f"{prefix} {name} — <b>{stars}</b> ⭐")
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=back_menu())
-
-
 # ============ CALLBACK ============
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
-    user = db_get_user(user_id, call.from_user.username)
+    username = call.from_user.username
+    user = db_get_user(user_id, username)
 
     # --- Главное меню ---
     if call.data == "main_menu":
@@ -303,7 +335,7 @@ def handle_callback(call):
     # --- Слоты ---
     elif call.data == "game_slots":
         bet = SLOT_BET
-        if not db_try_bet(user_id, bet):
+        if not db_try_bet(user_id, bet, username):
             bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
             return
 
@@ -332,7 +364,7 @@ def handle_callback(call):
     # --- Кубик ---
     elif call.data == "game_dice":
         bet = DICE_BET
-        if not db_try_bet(user_id, bet):
+        if not db_try_bet(user_id, bet, username):
             bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
             return
 
@@ -375,49 +407,21 @@ def handle_callback(call):
             coin_choice_menu()
         )
 
-    # --- Монетка: игрок выбрал Орла ---
+    # --- Монетка: выбран Орёл ---
     elif call.data == "coin_heads":
-        play_coin(call, user_id, "Орёл")
+        play_coin(call, user_id, username, "Орёл")
 
-    # --- Монетка: игрок выбрал Решку ---
+    # --- Монетка: выбрана Решка ---
     elif call.data == "coin_tails":
-        play_coin(call, user_id, "Решка")
+        play_coin(call, user_id, username, "Решка")
 
     # --- Неизвестный callback ---
     else:
         bot.answer_callback_query(call.id, text="Неизвестная команда 🤔")
 
 
-def play_coin(call, user_id, player_choice):
-    bet = COIN_BET
-    if not db_try_bet(user_id, bet):
-        bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
-        return
-
-    result = random.choice(["Орёл", "Решка"])
-    emoji = "🦅" if result == "Орёл" else "👑"
-
-    if player_choice == result:
-        win = bet * 2
-        db_update_stars(user_id, win)
-        db_update_after_game(user_id, win - bet)
-        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n🎉 Угадал! +{win} ⭐"
-    else:
-        db_update_after_game(user_id, -bet)
-        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n😢 Мимо. -{bet} ⭐"
-
-    new_user = db_get_user(user_id)
-    bot.answer_callback_query(call.id)
-    safe_edit(
-        call.message.chat.id,
-        call.message.message_id,
-        f"{msg}\n\n⭐ Баланс: <b>{new_user['stars']}</b>",
-        after_game_menu()
-    )
-
-
 # ============ ЗАПУСК ============
 if __name__ == "__main__":
     db_init()
     print("🚀 Казино-бот запущено. Ожидаю сообщений...")
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
