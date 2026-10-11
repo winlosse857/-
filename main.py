@@ -721,6 +721,8 @@ def main():
     db.select("mechagram_users", {"select": "telegram_id", "limit": "1"})
     db.select("mechagram_imports", {"select": "source", "limit": "1"})
     import_legacy_json()
+    me = bot.get_me()
+    log.info("Mechagram Bot API connected as @%s", getattr(me, "username", None) or "unknown")
     threading.Thread(target=scheduler_loop, name="scheduler", daemon=True).start()
     log.info("Mechagram starting; custom API=%s; Supabase=%s", SERVER_URL, SUPABASE_URL)
     bot.infinity_polling(
