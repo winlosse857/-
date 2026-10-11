@@ -230,18 +230,16 @@ def diag_command(message):
 
     check("getMe", lambda: "бот доступен как @" + str(getattr(bot.get_me(), "username", None) or "unknown"))
 
+    def chat_summary(chat_id):
+        chat = bot.get_chat(chat_id)
+        return f"title={getattr(chat, 'title', None)!r}, type={getattr(chat, 'type', None)!r}"
+
     channels = user_channels(message.from_user.id)
     channel = channels[0] if channels else None
     if channel:
-        check("getChat", lambda: (
-            f"title={getattr(bot.get_chat(channel['chat_id']), 'title', None)!r}, "
-            f"type={getattr(bot.get_chat(channel['chat_id']), 'type', None)!r}"
-        ))
+        check("getChat", lambda: chat_summary(channel["chat_id"]))
     elif TARGET_CHANNEL_ID:
-        check("getChat", lambda: (
-            f"title={getattr(bot.get_chat(TARGET_CHANNEL_ID), 'title', None)!r}, "
-            f"type={getattr(bot.get_chat(TARGET_CHANNEL_ID), 'type', None)!r}"
-        ))
+        check("getChat", lambda: chat_summary(TARGET_CHANNEL_ID))
     else:
         results.append("SKIP getChat: у пользователя нет подключённого канала")
 
