@@ -219,7 +219,7 @@ def play_coin(call, user_id, username, player_choice):
         win = bet * 2
         db_update_stars(user_id, win)
         db_update_after_game(user_id, win - bet)
-        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n🎉 Угадал! +{win} ⭐"
+        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n🎉 Угадал! +{bet} ⭐"
     else:
         db_update_after_game(user_id, -bet)
         msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n😢 Мимо. -{bet} ⭐"
@@ -272,9 +272,9 @@ def cmd_help(message):
         "/balance — мой баланс\n"
         "/top — топ игроков\n"
         "/help — эта справка\n\n"
-        "🎰 Слоты — 50 ⭐\n"
-        "🎲 Кубик — 25 ⭐\n"
-        "🪙 Монетка — 10 ⭐"
+        "🎰 Слоты — 50 ⭐ (шанс 50%)\n"
+        "🎲 Кубик — 25 ⭐ (шанс 50%)\n"
+        "🪙 Монетка — 10 ⭐ (шанс 50%)"
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=back_menu())
 
@@ -332,7 +332,7 @@ def handle_callback(call):
             back_menu()
         )
 
-    # --- Слоты ---
+    # --- Слоты (честные 50/50) ---
     elif call.data == "game_slots":
         bet = SLOT_BET
         if not db_try_bet(user_id, bet, username):
@@ -340,17 +340,24 @@ def handle_callback(call):
             return
 
         symbols = ["🍒", "🍋", "7️⃣", "💎", "⭐"]
-        spin = [random.choice(symbols) for _ in range(3)]
-        result = " | ".join(spin)
 
-        if spin[0] == spin[1] == spin[2]:
-            win = bet * 5
+        # Честный бросок: 50% победа
+        if random.random() < 0.5:
+            # Выигрыш — три одинаковых
+            symbol = random.choice(symbols)
+            spin = [symbol, symbol, symbol]
+            win = bet * 2
             db_update_stars(user_id, win)
             db_update_after_game(user_id, win - bet)
-            msg = f"🎰 [ {result} ]\n\n🎉 <b>ДЖЕКПОТ!</b> +{win} ⭐"
+            msg = f"🎰 [ {' | '.join(spin)} ]\n\n🎉 <b>ПОБЕДА!</b> +{bet} ⭐"
         else:
+            # Проигрыш — гарантированно разные символы
+            while True:
+                spin = [random.choice(symbols) for _ in range(3)]
+                if not (spin[0] == spin[1] == spin[2]):
+                    break
             db_update_after_game(user_id, -bet)
-            msg = f"🎰 [ {result} ]\n\n😢 Не повезло. -{bet} ⭐"
+            msg = f"🎰 [ {' | '.join(spin)} ]\n\n😢 Не повезло. -{bet} ⭐"
 
         new_user = db_get_user(user_id)
         bot.answer_callback_query(call.id)
@@ -361,29 +368,34 @@ def handle_callback(call):
             after_game_menu()
         )
 
-    # --- Кубик ---
+    # --- Кубик (честные 50/50) ---
     elif call.data == "game_dice":
         bet = DICE_BET
         if not db_try_bet(user_id, bet, username):
             bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
             return
 
-        player = random.randint(1, 6)
-        dealer = random.randint(1, 6)
-        msg = f"🎲 Ты: <b>{player}</b>\n🎲 Дилер: <b>{dealer}</b>\n\n"
-
-        if player > dealer:
+        # Честный бросок: 50% победа
+        if random.random() < 0.5:
+            player = random.randint(4, 6)
+            dealer = random.randint(1, 3)
             win = bet * 2
             db_update_stars(user_id, win)
             db_update_after_game(user_id, win - bet)
-            msg += f"🎉 <b>Победа!</b> +{win} ⭐"
-        elif player == dealer:
-            db_update_stars(user_id, bet)
-            db_update_after_game(user_id, 0)
-            msg += "🤝 Ничья. Ставка возвращена."
+            msg = (
+                f"🎲 Ты: <b>{player}</b>\n"
+                f"🎲 Дилер: <b>{dealer}</b>\n\n"
+                f"🎉 <b>Победа!</b> +{bet} ⭐"
+            )
         else:
+            player = random.randint(1, 3)
+            dealer = random.randint(4, 6)
             db_update_after_game(user_id, -bet)
-            msg += f"😢 Проигрыш. -{bet} ⭐"
+            msg = (
+                f"🎲 Ты: <b>{player}</b>\n"
+                f"🎲 Дилер: <b>{dealer}</b>\n\n"
+                f"😢 Проигрыш. -{bet} ⭐"
+            )
 
         new_user = db_get_user(user_id)
         bot.answer_callback_query(call.id)
