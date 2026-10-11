@@ -25,6 +25,7 @@ DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
 POLL_SECONDS = max(2, int(os.getenv("POLL_SECONDS", "10")))
 DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
 SCHEDULER_SECONDS = max(2, int(os.getenv("SCHEDULER_SECONDS", "5")))
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0") or "0")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("mechagram")
@@ -309,6 +310,21 @@ def new_command(message):
     if not require_private(message):
         return
     clear_session(message.from_user.id)
+    if TARGET_CHANNEL_ID:
+        user_id = message.from_user.id
+        ensure_user(user_id)
+        existing = db.select("mechagram_channels", {"select": "*", "chat_id": f"eq.{TARGET_CHANNEL_ID}", "limit": "1"})
+        payload = {"owner_telegram_id": int(user_id), "chat_id": TARGET_CHANNEL_ID, "title": "Основной канал", "username": None}
+        if existing:
+            rows = db.update("mechagram_channels", {"id": f"eq.{existing[0]['id']}"}, payload)
+        else:
+            rows = db.insert("mechagram_channels", payload)
+        channel = rows[0] if rows else None
+        if not channel:
+            bot.reply_to(message, "Не удалось подключить настроенный канал. Проверьте базу данных.")
+            return
+        begin_new_post(user_id, channel)
+        return
     channel_picker(message.from_user.id, "new")
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отмена")
