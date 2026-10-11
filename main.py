@@ -211,6 +211,70 @@ def prompt_datetime(user_id, message):
         f"Когда публиковать? Часовой пояс: {tz_name}\nФормат: ГГГГ-ММ-ДД ЧЧ:ММ\nПример: 2026-12-31 18:30\nДля повтора добавьте /daily или /weekly после времени. Для разовой публикации ничего добавлять не нужно."
     )
 
+@bot.message_handler(commands=["diag"])
+def diag_command(message):
+    """Run read-only API checks and report concise results; never log the bot token."""
+    if not require_private(message):
+        return
+
+    results = []
+    def check(label, operation):
+        try:
+            value = operation()
+            results.append(f"OK {label}: {value}")
+            log.info("DIAG user=%s check=%s status=OK result=%s", message.from_user.id, label, str(value)[:250])
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:220]}"
+            results.append(f"ERROR {label}: {detail}")
+            log.warning("DIAG user=%s check=%s status=ERROR detail=%s", message.from_user.id, label, detail)
+
+    check("getMe", lambda: "бот доступен как @" + str(getattr(bot.get_me(), "username", None) or "unknown"))
+
+    channels = user_channels(message.from_user.id)
+    channel = channels[0] if channels else None
+    if channel:
+        check("getChat", lambda: (
+            f"title={getattr(bot.get_chat(channel['chat_id']), 'title', None)!r}, "
+            f"type={getattr(bot.get_chat(channel['chat_id']), 'type', None)!r}"
+        ))
+    elif TARGET_CHANNEL_ID:
+        check("getChat", lambda: (
+            f"title={getattr(bot.get_chat(TARGET_CHANNEL_ID), 'title', None)!r}, "
+            f"type={getattr(bot.get_chat(TARGET_CHANNEL_ID), 'type', None)!r}"
+        ))
+    else:
+        results.append("SKIP getChat: у пользователя нет подключённого канала")
+
+    media_file_id = None
+    try:
+        posts = db.select("mechagram_posts", {
+            "select": "media", "owner_telegram_id": f"eq.{message.from_user.id}",
+            "status": "eq.failed", "order": "updated_at.desc", "limit": "10"
+        })
+        for post in posts:
+            for item in (post.get("media") or []):
+                if item.get("type") == "video" and item.get("file_id"):
+                    media_file_id = item["file_id"]
+                    break
+            if media_file_id:
+                break
+    except Exception as exc:
+        results.append(f"ERROR чтение сохранённого видео из БД: {type(exc).__name__}: {str(exc)[:180]}")
+
+    if media_file_id:
+        check("getFile(video)", lambda: (
+            f"file_path={getattr(bot.get_file(media_file_id), 'file_path', None)!r}"
+        ))
+    else:
+        results.append("SKIP getFile(video): не найден file_id видео в неудачных публикациях")
+
+    report = "Диагностика Mechagram (только проверки, публикаций не отправляет):\n" + "\n".join(results)
+    try:
+        bot.reply_to(message, report)
+    except Exception:
+        log.exception("DIAG could not send report to user=%s; see preceding DIAG log entries", message.from_user.id)
+
+
 @bot.message_handler(commands=["start", "help"])
 def start(message):
     if not require_private(message):
