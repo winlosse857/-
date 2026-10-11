@@ -23,6 +23,7 @@ if not SUPABASE_KEY:
     raise RuntimeError("Set SUPABASE_SERVICE_ROLE_KEY in Railway variables.")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
 POLL_SECONDS = max(2, int(os.getenv("POLL_SECONDS", "10")))
+DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
 SCHEDULER_SECONDS = max(2, int(os.getenv("SCHEDULER_SECONDS", "5")))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -532,7 +533,7 @@ def content_handler(message):
             changed = db.update("mechagram_posts", {
                 "id": f"eq.{int(edit_id)}", "owner_telegram_id": f"eq.{message.from_user.id}",
                 "status": "eq.pending"
-            }, {k: v for k, v in payload.items() if k not in ("owner_telegram_id", "channel_id")})
+            }, {k: v for k, v in payload.items() if k != "owner_telegram_id"})
             if not changed:
                 bot.reply_to(message, "Публикация уже не ожидает отправки, изменения не сохранены.")
             else:
@@ -620,10 +621,106 @@ def scheduler_loop():
             log.exception("Scheduler iteration failed")
         time.sleep(SCHEDULER_SECONDS)
 
+
+def import_legacy_json():
+    """One-time, idempotent import from the persistent JSON volume used by the old bot."""
+    if not os.path.isfile(DATA_FILE):
+        log.info("No legacy JSON file at %s; skipping import", DATA_FILE)
+        return
+    marker = db.select("mechagram_imports", {
+        "select": "source", "source": "eq.legacy_json_v1", "limit": "1"
+    })
+    if marker:
+        log.info("Legacy JSON import already completed")
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as stream:
+            legacy = json.load(stream)
+    except Exception:
+        log.exception("Could not read legacy JSON; startup will continue without importing it")
+        return
+    imported_users, imported_channels, imported_posts = set(), 0, 0
+    settings_rows = legacy.get("bot_settings") or []
+    settings = settings_rows[0] if settings_rows else {}
+    owner = settings.get("owner_telegram_id")
+    timezone_name = settings.get("timezone") or DEFAULT_TIMEZONE
+    channel_by_chat = {}
+    if owner:
+        owner = int(owner)
+        ensure_user(owner)
+        db.update("mechagram_users", {"telegram_id": "eq." + str(owner)}, {"timezone": timezone_name})
+        imported_users.add(owner)
+        if settings.get("channel_id"):
+            ch = bind_channel(owner, int(settings["channel_id"]),
+                              settings.get("channel_title") or "Импортированный канал",
+                              settings.get("channel_username"))
+            if ch:
+                channel_by_chat[str(settings["channel_id"])] = ch
+                imported_channels += 1
+    for old in legacy.get("scheduled_posts") or []:
+        try:
+            old_id = int(old.get("id"))
+            old_owner = int(old["owner_telegram_id"])
+            raw_chat_id = old.get("channel_id") or settings.get("channel_id")
+            if not raw_chat_id or old_id < 1:
+                continue
+            chat_id = int(raw_chat_id)
+            ensure_user(old_owner)
+            imported_users.add(old_owner)
+            ch = channel_by_chat.get(str(chat_id))
+            if not ch:
+                found = db.select("mechagram_channels", {
+                    "select": "*", "chat_id": "eq." + str(chat_id),
+                    "owner_telegram_id": "eq." + str(old_owner), "limit": "1"
+                })
+                ch = found[0] if found else bind_channel(old_owner, chat_id, "Импортированный канал")
+                if ch:
+                    channel_by_chat[str(chat_id)] = ch
+                    imported_channels += 1
+            if not ch:
+                continue
+            already = db.select("mechagram_posts", {
+                "select": "id", "legacy_post_id": "eq." + str(old_id), "limit": "1"
+            })
+            if already:
+                continue
+            media = old.get("media") or []
+            content = old.get("content") or ""
+            media_types = {item.get("type") for item in media}
+            content_type = "album" if len(media) > 1 else (next(iter(media_types)) if media_types else "text")
+            if content_type not in ("text", "photo", "video", "album"):
+                content_type = "text"
+            status = old.get("status", "pending")
+            if status not in ("pending", "sent", "cancelled", "failed"):
+                status = "pending"
+            recurrence = old.get("recurrence", "once")
+            if recurrence not in ("once", "daily", "weekly"):
+                recurrence = "once"
+            scheduled_at = old.get("publish_at") or old.get("scheduled_at")
+            if not scheduled_at:
+                continue
+            db.insert("mechagram_posts", {
+                "legacy_post_id": old_id, "owner_telegram_id": old_owner,
+                "channel_id": ch["id"], "content_type": content_type,
+                "text_content": content, "media": media, "scheduled_at": scheduled_at,
+                "recurrence": recurrence, "status": status,
+                "error_message": old.get("error_message"), "sent_at": old.get("sent_at")
+            })
+            imported_posts += 1
+        except Exception:
+            log.exception("Skipping legacy post id=%s during import", old.get("id"))
+    db.insert("mechagram_imports", {
+        "source": "legacy_json_v1",
+        "details": {"users_seen": len(imported_users), "channels_seen": imported_channels, "posts_imported": imported_posts}
+    })
+    log.info("Legacy import finished: users=%s channels=%s posts=%s",
+             len(imported_users), imported_channels, imported_posts)
+
 def main():
-    # Fail fast if credentials, API access, or migrations are incorrect.
+    # Fail fast if credentials, API access, and the schema are available.
     db.select("mechagram_users", {"select": "telegram_id", "limit": "1"})
-    db.rpc("mechagram_claim_due_posts")
+    db.select("mechagram_imports", {"select": "source", "limit": "1"})
+    import_legacy_json()
     threading.Thread(target=scheduler_loop, name="scheduler", daemon=True).start()
     log.info("Mechagram starting; custom API=%s; Supabase=%s", SERVER_URL, SUPABASE_URL)
     bot.infinity_polling(
