@@ -19,7 +19,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("scheduler-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_SETUP_CODE = os.environ["OWNER_SETUP_CODE"]
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
@@ -238,32 +237,62 @@ def current_channel():
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    parts = (message.text or "").split(maxsplit=1)
     current_owner = owner_id()
     if current_owner is None:
-        if len(parts) != 2 or parts[1].strip() != OWNER_SETUP_CODE:
-            bot.reply_to(message, "Для первой активации отправьте: /start КОД_АКТИВАЦИИ\nКод задаётся в переменной OWNER_SETUP_CODE на Railway.")
-            return
-        # A unique row with a fixed singleton id ensures one initial owner.
-        try:
-            db.table("bot_settings").insert({
-                "id": 1,
-                "owner_telegram_id": message.from_user.id,
-                "timezone": DEFAULT_TIMEZONE
-            }).execute()
-        except Exception:
-            # Another activation may have won the race; never overwrite its owner.
-            pass
-        if not is_owner(message.from_user.id):
-            bot.reply_to(message, "Активация уже выполнена другим пользователем. Обратитесь к владельцу.")
-            return
-        bot.reply_to(message, "Бот активирован. Вы — владелец.\nДобавьте бота администратором канала, затем подключите канал кнопкой «📣 Подключить канал» или командой /bind @username.", reply_markup=main_keyboard())
+        bot.reply_to(
+            message,
+            "Привет! Чтобы привязать канал, добавьте меня в него администратором. "
+            "Я подключу канал автоматически — код активации не нужен."
+        )
         return
     if not is_owner(message.from_user.id):
-        bot.reply_to(message, "Этот бот приватный и доступен только владельцу.")
+        bot.reply_to(message, "Этот бот закреплён за другим владельцем. Добавьте бота в свой канал, чтобы привязать его к себе.")
         return
-    bot.reply_to(message, "Привет! Я планировщик публикаций.\n\n/bind @channel — подключить канал\n/new — создать публикацию\n/list — список запланированных\n/timezone Europe/Moscow — часовой пояс", reply_markup=main_keyboard())
+    row = settings_row() or {}
+    channel = row.get("channel_title") or "не подключён"
+    bot.reply_to(
+        message,
+        f"Привет! Я планировщик публикаций.\\nКанал: {channel}\\n\\n"
+        "/new — создать публикацию\\n/list — список запланированных\\n"
+        "/timezone Europe/Moscow — часовой пояс",
+        reply_markup=main_keyboard()
+    )
 
+
+@bot.my_chat_member_handler()
+def auto_bind_channel(update):
+    chat = update.chat
+    if getattr(chat, "type", None) != "channel":
+        return
+    new_member = getattr(update, "new_chat_member", None)
+    status = getattr(new_member, "status", "")
+    if status not in ("administrator", "creator"):
+        return
+    actor = getattr(update, "from_user", None)
+    if actor is None:
+        log.warning("Cannot auto-bind channel %s: no adding user in update", chat.id)
+        return
+    try:
+        row = settings_row()
+        payload = {
+            "owner_telegram_id": actor.id,
+            "channel_id": str(chat.id),
+            "channel_title": getattr(chat, "title", "Канал"),
+            "channel_username": getattr(chat, "username", None),
+        }
+        if row:
+            db.table("bot_settings").update(payload).eq("id", row["id"]).execute()
+        else:
+            payload.update({"id": 1, "timezone": DEFAULT_TIMEZONE})
+            db.table("bot_settings").insert(payload).execute()
+        bot.send_message(
+            actor.id,
+            f"Канал «{getattr(chat, 'title', 'Канал')}» привязан автоматически. "
+            "Теперь отправьте /start, чтобы планировать публикации."
+        )
+        log.info("Channel %s auto-bound to user %s", chat.id, actor.id)
+    except Exception:
+        log.exception("Automatic channel binding failed")
 
 @bot.message_handler(commands=["bind"])
 def bind(message):
