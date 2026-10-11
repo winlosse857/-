@@ -3,11 +3,17 @@ import time
 import json
 import threading
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import telebot
-from telebot import types
+from telebot import types, apihelper
+
+# Mechagram uses a custom Bot API server, not api.telegram.org.
+SERVER_URL = "http://177.3.213.27:8081"
+apihelper.API_URL = f"{SERVER_URL}/bot{{0}}/{{1}}"
+apihelper.FILE_URL = f"{SERVER_URL}/file/bot{{0}}/{{1}}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("scheduler-bot")
@@ -433,7 +439,7 @@ def handle_content(message):
     elif session.get("step") == "datetime" and message.text:
         row = settings_row()
         daily = "/daily" in message.text.lower()
-        cleaned = message.text.replace("/daily", "").replace("/DAILY", "").strip()
+        cleaned = re.sub(r"(?i)\\s*/daily\\b", "", message.text).strip()
         try:
             publish_at = parse_local_datetime(cleaned, row["timezone"])
             if publish_at <= utcnow():
@@ -523,7 +529,12 @@ def scheduler_loop():
                 try:
                     publish_post(post)
                     if post.get("recurrence") == "daily":
-                        next_time = datetime.fromisoformat(post["publish_at"].replace("Z", "+00:00")) + timedelta(days=1)
+                        settings = settings_row() or {}
+                        timezone_name = settings.get("timezone", DEFAULT_TIMEZONE)
+                        published_utc = datetime.fromisoformat(post["publish_at"].replace("Z", "+00:00"))
+                        published_local = published_utc.astimezone(ZoneInfo(timezone_name))
+                        next_local = (published_local.replace(tzinfo=None) + timedelta(days=1)).replace(tzinfo=ZoneInfo(timezone_name))
+                        next_time = next_local.astimezone(timezone.utc)
                         db.table("scheduled_posts").update({
                             "status": "pending", "publish_at": next_time.isoformat(),
                             "published_at": utcnow().isoformat(), "error": None
