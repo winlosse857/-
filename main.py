@@ -439,7 +439,7 @@ def handle_content(message):
     elif session.get("step") == "datetime" and message.text:
         row = settings_row()
         daily = "/daily" in message.text.lower()
-        cleaned = re.sub(r"(?i)\\s*/daily\\b", "", message.text).strip()
+        cleaned = re.sub(r"(?i)\s*/daily\b", "", message.text).strip()
         try:
             publish_at = parse_local_datetime(cleaned, row["timezone"])
             if publish_at <= utcnow():
