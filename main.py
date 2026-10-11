@@ -19,7 +19,6 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 DATA_FILE = os.getenv("DATA_FILE", "/data/bot_data.json")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
-db = JsonStore(DATA_FILE)
 
 
 # Small JSON-backed replacement for the Supabase query calls used below.
@@ -136,6 +135,7 @@ class JsonStore:
         return JsonQuery(self, name)
 
 # Conversation state is temporary; scheduled posts and settings are stored in JSON.
+db = JsonStore(DATA_FILE)
 sessions = {}
 session_lock = threading.Lock()
 album_buffers = {}
