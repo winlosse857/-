@@ -1,5 +1,3 @@
--- Run this script in Supabase SQL Editor.
-create table if not exists public.bot_settings (
     id bigint primary key,
     owner_telegram_id bigint unique,
     channel_id text,
