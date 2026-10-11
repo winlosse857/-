@@ -1,439 +1,549 @@
 import os
-import random
 import sqlite3
+import logging
+import threading
 import time
+from datetime import datetime, timedelta
+
 import telebot
-from telebot import apihelper
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot import types
 
-# ============ НАСТРОЙКИ ============
-TOKEN = os.environ.get("BOT_TOKEN")
-SERVER_URL = os.environ.get("SERVER_URL", "http://177.3.213.27:8081")
-DB_PATH = os.environ.get("DB_PATH", "casino.db")
+# ============ КОНФИГ ИЗ ОКРУЖЕНИЯ ============
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Переменная окружения BOT_TOKEN не задана. "
+        "Установите её в Railway → Variables."
+    )
 
-if not TOKEN:
-    raise SystemExit("❌ Не задана переменная окружения BOT_TOKEN")
+_admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = [int(x) for x in _admin_ids_raw.split(",") if x.strip().isdigit()]
 
-apihelper.API_URL = f"{SERVER_URL}/bot{{0}}/{{1}}"
-apihelper.FILE_URL = f"{SERVER_URL}/file/bot{{0}}/{{1}}"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posts.db")
+# ============================================
 
-bot = telebot.TeleBot(TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
-# ============ КОНСТАНТЫ ============
-START_BALANCE = 100
-DAILY_BONUS_MIN = 50
-DAILY_BONUS_MAX = 150
-DAILY_COOLDOWN = 24 * 60 * 60
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-SLOT_BET = 50
-DICE_BET = 25
-COIN_BET = 10
+# user_states[user_id] = {"state": "...", "data": {...}}
+user_states = {}
 
 
-# ============ БАЗА ДАННЫХ ============
+def is_allowed(user_id: int) -> bool:
+    """Если ADMIN_IDS пуст — доступ открыт всем. Иначе — только им."""
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+# ================= БАЗА ДАННЫХ =================
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id      INTEGER PRIMARY KEY,
-            username     TEXT,
-            stars        INTEGER DEFAULT 0,
-            last_bonus   INTEGER DEFAULT 0,
-            games_played INTEGER DEFAULT 0,
-            total_won    INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            username TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, chat_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            content_type TEXT NOT NULL DEFAULT 'text',
+            text TEXT DEFAULT '',
+            file_id TEXT DEFAULT NULL,
+            publish_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
         )
     """)
     conn.commit()
     conn.close()
 
 
-def db_get_user(user_id, username=None):
+# --- Каналы ---
+def db_add_channel(user_id: int, chat_id: int, title: str, username: str | None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "SELECT user_id, username, stars, last_bonus, games_played, total_won FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-    row = cur.fetchone()
-    if row is None:
-        cur.execute(
-            "INSERT INTO users (user_id, username, stars, last_bonus) VALUES (?, ?, ?, 0)",
-            (user_id, username or "", START_BALANCE)
-        )
-        conn.commit()
-        row = (user_id, username or "", START_BALANCE, 0, 0, 0)
-    conn.close()
-    return {
-        "user_id": row[0],
-        "username": row[1],
-        "stars": row[2],
-        "last_bonus": row[3],
-        "games_played": row[4],
-        "total_won": row[5],
-    }
-
-
-def db_update_stars(user_id, delta):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET stars = stars + ? WHERE user_id = ?", (delta, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_try_bet(user_id, bet, username=None):
-    """Атомарно списывает ставку. True — если хватило баланса, False — если нет."""
-    db_get_user(user_id, username)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET stars = stars - ? WHERE user_id = ? AND stars >= ?",
-        (bet, user_id, bet)
-    )
-    affected = cur.rowcount
-    conn.commit()
-    conn.close()
-    return affected > 0
-
-
-def db_update_after_game(user_id, won_amount):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET games_played = games_played + 1, total_won = total_won + ? WHERE user_id = ?",
-        (won_amount, user_id)
+        """INSERT OR REPLACE INTO channels
+           (user_id, chat_id, title, username, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (user_id, chat_id, title, username,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
     conn.commit()
     conn.close()
 
 
-def db_set_last_bonus(user_id, ts):
+def db_get_channels(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("UPDATE users SET last_bonus = ? WHERE user_id = ?", (ts, user_id))
-    conn.commit()
-    conn.close()
-
-
-def db_top(limit=10):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT username, user_id, stars FROM users ORDER BY stars DESC LIMIT ?",
-        (limit,)
-    )
+    cur.execute("""SELECT chat_id, title, username FROM channels
+                   WHERE user_id=? ORDER BY id""", (user_id,))
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-# ============ КЛАВИАТУРЫ ============
-def main_menu():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(text="🎰 Слоты (50)", callback_data="game_slots"),
-        InlineKeyboardButton(text="🎲 Кубик (25)", callback_data="game_dice"),
-        InlineKeyboardButton(text="🪙 Монетка (10)", callback_data="game_coin"),
-        InlineKeyboardButton(text="⭐ Мой баланс", callback_data="check_balance"),
-        InlineKeyboardButton(text="🎁 Ежедневный бонус", callback_data="daily_bonus"),
-        InlineKeyboardButton(text="🏆 Топ игроков", callback_data="top_players"),
+def db_get_channel(user_id: int, chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""SELECT chat_id, title, username FROM channels
+                   WHERE user_id=? AND chat_id=?""", (user_id, chat_id))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def db_delete_channel(user_id: int, chat_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM channels WHERE user_id=? AND chat_id=?",
+                (user_id, chat_id))
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return changed > 0
+
+
+# --- Посты ---
+def db_add_post(user_id: int, channel_id: int, content_type: str,
+                text: str, file_id: str | None, publish_at: datetime) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO posts
+           (user_id, channel_id, content_type, text, file_id,
+            publish_at, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+        (user_id, channel_id, content_type, text or "", file_id,
+         publish_at.strftime("%Y-%m-%d %H:%M:%S"),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
-    return kb
+    conn.commit()
+    post_id = cur.lastrowid
+    conn.close()
+    return post_id
 
 
-def back_menu():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu"))
-    return kb
+def db_get_pending_posts():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""SELECT id, user_id, channel_id, content_type, text,
+                          file_id, publish_at
+                   FROM posts WHERE status='pending' ORDER BY publish_at""")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
-def after_game_menu():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(text="🔁 Слоты", callback_data="game_slots"),
-        InlineKeyboardButton(text="🎲 Кубик", callback_data="game_dice"),
-        InlineKeyboardButton(text="🪙 Монетка", callback_data="game_coin"),
-        InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu"),
-    )
-    return kb
+def db_get_user_posts(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""SELECT id, channel_id, content_type, text, file_id, publish_at
+                   FROM posts WHERE user_id=? AND status='pending'
+                   ORDER BY publish_at""", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
-def coin_choice_menu():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(text="🦅 Орёл", callback_data="coin_heads"),
-        InlineKeyboardButton(text="👑 Решка", callback_data="coin_tails"),
-        InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu"),
-    )
-    return kb
+def db_get_post(post_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""SELECT id, user_id, channel_id, content_type, text,
+                          file_id, publish_at, status
+                   FROM posts WHERE id=?""", (post_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
-# ============ ХЕЛПЕРЫ ============
-def safe_edit(chat_id, message_id, text, reply_markup=None):
-    """Пытается отредактировать сообщение, если не выходит — отправляет новое."""
+def db_mark_published(post_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE posts SET status='published' WHERE id=?", (post_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_delete_post(post_id: int, user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM posts WHERE id=? AND user_id=? AND status='pending'",
+                (post_id, user_id))
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return changed > 0
+
+
+# ================= УТИЛИТЫ =================
+ICONS = {
+    "text": "📝", "photo": "🖼", "video": "🎬", "document": "📎",
+    "audio": "🎵", "voice": "🎤", "sticker": "🌟",
+    "animation": "🎞", "video_note": "⭕",
+}
+
+
+def preview_text(text: str, limit: int = 60) -> str:
+    if not text:
+        return ""
+    text = text.replace("\n", " ")
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def verify_bot_in_channel(chat_id) -> tuple[bool, str]:
+    """Проверяет, что бот — админ канала. Возвращает (ok, сообщение_об_ошибке)."""
     try:
-        bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
-        return
+        me = bot.get_me()
+        member = bot.get_chat_member(chat_id, me.id)
+        if member.status in ("administrator", "creator"):
+            return True, ""
+        return False, ("Я не администратор этого канала. "
+                       "Добавьте меня в канал и выдайте право «Публикация сообщений».")
+    except telebot.apihelper.ApiTelegramException as e:
+        return False, f"Не удалось проверить права в канале: {e.description}"
     except Exception as e:
-        err = str(e)
-        if "not modified" in err:
-            return
-        print(f"[safe_edit] edit failed: {err}")
+        return False, f"Ошибка проверки канала: {e}"
+
+
+# ================= ПУБЛИКАЦИЯ =================
+def publish_post(post_id: int):
+    row = db_get_post(post_id)
+    if not row:
+        return
+    _, user_id, channel_id, ctype, text, file_id, publish_at, status = row
+    if status != "pending":
+        return
+
+    try:
+        if ctype == "text":
+            bot.send_message(channel_id, text, disable_web_page_preview=False)
+        elif ctype == "photo":
+            bot.send_photo(channel_id, file_id, caption=text or None)
+        elif ctype == "video":
+            bot.send_video(channel_id, file_id, caption=text or None)
+        elif ctype == "document":
+            bot.send_document(channel_id, file_id, caption=text or None)
+        elif ctype == "audio":
+            bot.send_audio(channel_id, file_id, caption=text or None)
+        elif ctype == "voice":
+            bot.send_voice(channel_id, file_id, caption=text or None)
+        elif ctype == "sticker":
+            bot.send_sticker(channel_id, file_id)
+        elif ctype == "animation":
+            bot.send_animation(channel_id, file_id, caption=text or None)
+        elif ctype == "video_note":
+            bot.send_video_note(channel_id, file_id)
+
+        db_mark_published(post_id)
+        log.info(f"Пост #{post_id} ({ctype}) → канал {channel_id}")
+
         try:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
-        except Exception as e2:
-            print(f"[safe_edit] send also failed: {e2}")
+            bot.send_message(user_id, f"✅ Пост #{post_id} опубликован.")
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception(f"Ошибка публикации поста #{post_id}: {e}")
+        try:
+            bot.send_message(user_id,
+                             f"⚠️ Не удалось опубликовать пост #{post_id}: {e}")
+        except Exception:
+            pass
 
 
-def send_top(chat_id):
-    rows = db_top(10)
-    if not rows:
-        bot.send_message(chat_id, "Пока никто не играл 🤷", reply_markup=back_menu())
-        return
-    lines = ["🏆 <b>Топ игроков:</b>\n"]
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (username, user_id, stars) in enumerate(rows):
-        prefix = medals[i] if i < 3 else f"{i+1}."
-        name = f"@{username}" if username else f"id{user_id}"
-        lines.append(f"{prefix} {name} — <b>{stars}</b> ⭐")
-    bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=back_menu())
+# ================= ПЛАНИРОВЩИК =================
+def schedule_worker():
+    while True:
+        try:
+            now = datetime.now()
+            for post_id, *_ in db_get_pending_posts():
+                row = db_get_post(post_id)
+                if not row:
+                    continue
+                try:
+                    publish_at = datetime.strptime(row[6], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if publish_at <= now:
+                    publish_post(post_id)
+        except Exception as e:
+            log.exception(f"Ошибка в планировщике: {e}")
+        time.sleep(10)
 
 
-def play_coin(call, user_id, username, player_choice):
-    bet = COIN_BET
-    if not db_try_bet(user_id, bet, username):
-        bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
-        return
-
-    result = random.choice(["Орёл", "Решка"])
-    emoji = "🦅" if result == "Орёл" else "👑"
-
-    if player_choice == result:
-        win = bet * 2
-        db_update_stars(user_id, win)
-        db_update_after_game(user_id, win - bet)
-        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n🎉 Угадал! +{bet} ⭐"
-    else:
-        db_update_after_game(user_id, -bet)
-        msg = f"🪙 Выпало: {emoji} <b>{result}</b>\n\n😢 Мимо. -{bet} ⭐"
-
-    new_user = db_get_user(user_id)
-    bot.answer_callback_query(call.id)
-    safe_edit(
-        call.message.chat.id,
-        call.message.message_id,
-        f"{msg}\n\n⭐ Баланс: <b>{new_user['stars']}</b>",
-        after_game_menu()
+# ================= КЛАВИАТУРЫ =================
+def main_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📝 Создать пост", callback_data="menu:create"),
+        types.InlineKeyboardButton("📢 Мои каналы", callback_data="menu:channels"),
+        types.InlineKeyboardButton("➕ Привязать канал", callback_data="menu:bind"),
+        types.InlineKeyboardButton("📋 Мои посты", callback_data="menu:list"),
+        types.InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help"),
     )
+    return kb
 
 
-# ============ КОМАНДЫ ============
-@bot.message_handler(commands=['start'])
+def cancel_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"))
+    return kb
+
+
+def time_presets_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    now = datetime.now()
+    today_18 = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    if today_18 <= now:
+        today_18 += timedelta(days=1)
+    tomorrow_9 = (now + timedelta(days=1)).replace(
+        hour=9, minute=0, second=0, microsecond=0)
+
+    kb.add(
+        types.InlineKeyboardButton("⏱ Через 10 мин",
+                                   callback_data=f"t:{int((now + timedelta(minutes=10)).timestamp())}"),
+        types.InlineKeyboardButton("⏱ Через 1 час",
+                                   callback_data=f"t:{int((now + timedelta(hours=1)).timestamp())}"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🕕 Сегодня в 18:00",
+                                   callback_data=f"t:{int(today_18.timestamp())}"),
+        types.InlineKeyboardButton("🌅 Завтра в 9:00",
+                                   callback_data=f"t:{int(tomorrow_9.timestamp())}"),
+    )
+    kb.add(types.InlineKeyboardButton("⌨️ Ввести вручную",
+                                      callback_data="menu:manual_time"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"))
+    return kb
+
+
+def confirm_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("✅ Запланировать", callback_data="menu:confirm"),
+        types.InlineKeyboardButton("📢 Изменить канал", callback_data="menu:rewrite_channel"),
+        types.InlineKeyboardButton("✏️ Изменить текст", callback_data="menu:rewrite_text"),
+        types.InlineKeyboardButton("🕒 Изменить время", callback_data="menu:rewrite_time"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"),
+    )
+    return kb
+
+
+def channels_picker_kb(user_id: int, action: str):
+    """Список каналов пользователя с callback вида action:chat_id."""
+    rows = db_get_channels(user_id)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for chat_id, title, username in rows:
+        label = f"📢 {title}" + (f" ({username})" if username else "")
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"{action}:{chat_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel"))
+    return kb
+
+
+# ================= КОМАНДЫ =================
+@bot.message_handler(commands=["start"])
 def cmd_start(message):
-    user = db_get_user(message.from_user.id, message.from_user.username)
+    if not is_allowed(message.from_user.id):
+        bot.send_message(message.chat.id, "⛔ У вас нет доступа к этому боту.")
+        return
+    user_states.pop(message.from_user.id, None)
     text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"🌟 Добро пожаловать в звёздное казино Mechagram!\n\n"
-        f"⭐ Твой баланс: <b>{user['stars']}</b> звёзд\n"
-        f"🎮 Игр сыграно: {user['games_played']}\n\n"
-        f"Выбери игру:"
+        "👋 <b>Бот-планировщик постов</b>\n\n"
+        "Я публикую посты в ваши каналы по расписанию.\n\n"
+        "<b>Как начать:</b>\n"
+        "1. Привяжите канал кнопкой «➕ Привязать канал»\n"
+        "2. Создайте пост\n"
+        "3. Выберите канал, содержимое и время\n\n"
+        "Поддерживается текст, фото, видео, документы, аудио, "
+        "голосовые, стикеры, GIF.\n"
     )
-    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=main_menu())
+    bot.send_message(message.chat.id, text, reply_markup=main_menu_kb())
 
 
-@bot.message_handler(commands=['balance'])
-def cmd_balance(message):
-    user = db_get_user(message.from_user.id, message.from_user.username)
-    bot.send_message(
-        message.chat.id,
-        f"⭐ Твой баланс: <b>{user['stars']}</b> звёзд",
-        parse_mode="HTML",
-        reply_markup=back_menu()
-    )
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message):
+    user_states.pop(message.from_user.id, None)
+    bot.send_message(message.chat.id, "Действие отменено.",
+                     reply_markup=main_menu_kb())
 
 
-@bot.message_handler(commands=['top'])
-def cmd_top(message):
-    send_top(message.chat.id)
+@bot.message_handler(commands=["channels"])
+def cmd_channels(message):
+    if not is_allowed(message.from_user.id):
+        return
+    show_user_channels(message.chat.id, message.from_user.id)
 
 
-@bot.message_handler(commands=['help'])
-def cmd_help(message):
-    text = (
-        "📖 <b>Помощь</b>\n\n"
-        "/start — главное меню\n"
-        "/balance — мой баланс\n"
-        "/top — топ игроков\n"
-        "/help — эта справка\n\n"
-        "🎰 Слоты — 50 ⭐ (шанс 50%)\n"
-        "🎲 Кубик — 25 ⭐ (шанс 50%)\n"
-        "🪙 Монетка — 10 ⭐ (шанс 50%)"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=back_menu())
+# ================= ГЛАВНОЕ МЕНЮ =================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("menu:"))
+def menu_router(call):
+    if not is_allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Нет доступа")
+        return
+    action = call.data.split(":", 1)[1]
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
 
+    if action == "cancel":
+        user_states.pop(uid, None)
+        bot.answer_callback_query(call.id, "Отменено")
+        try:
+            bot.edit_message_text("Действие отменено.", chat_id=chat_id,
+                                  message_id=msg_id, reply_markup=main_menu_kb())
+        except Exception:
+            bot.send_message(chat_id, "Действие отменено.",
+                             reply_markup=main_menu_kb())
+        return
 
-# ============ CALLBACK ============
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    user_id = call.from_user.id
-    username = call.from_user.username
-    user = db_get_user(user_id, username)
-
-    # --- Главное меню ---
-    if call.data == "main_menu":
-        text = f"🏠 Главное меню\n\n⭐ Баланс: <b>{user['stars']}</b> звёзд"
-        safe_edit(call.message.chat.id, call.message.message_id, text, main_menu())
+    if action == "help":
         bot.answer_callback_query(call.id)
-
-    # --- Баланс ---
-    elif call.data == "check_balance":
-        bot.answer_callback_query(
-            call.id,
-            text=f"⭐ У тебя {user['stars']} звёзд",
-            show_alert=True
+        bot.send_message(
+            chat_id,
+            "ℹ️ <b>Как пользоваться</b>\n\n"
+            "<b>1. Привязка канала</b>\n"
+            "• Нажмите «➕ Привязать канал»\n"
+            "• Отправьте <code>@username</code> канала — либо\n"
+            "• Перешлите любое сообщение из своего канала "
+            "(для приватных каналов)\n"
+            "• Бот должен быть <b>администратором</b> канала "
+            "с правом «Публикация сообщений».\n\n"
+            "<b>2. Создание поста</b>\n"
+            "• Нажмите «📝 Создать пост»\n"
+            "• Выберите канал из списка\n"
+            "• Отправьте содержимое (текст или медиа с подписью)\n"
+            "• Выберите время кнопкой или введите вручную:\n"
+            "  <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+            "<b>3. Управление</b>\n"
+            "• «📋 Мои посты» — список запланированных\n"
+            "• «📢 Мои каналы» — привязанные каналы",
+            reply_markup=main_menu_kb()
         )
+        return
 
-    # --- Топ ---
-    elif call.data == "top_players":
+    if action == "channels":
         bot.answer_callback_query(call.id)
-        send_top(call.message.chat.id)
+        show_user_channels(chat_id, uid)
+        return
 
-    # --- Ежедневный бонус ---
-    elif call.data == "daily_bonus":
-        now = int(time.time())
-        if now - user["last_bonus"] < DAILY_COOLDOWN:
-            left = DAILY_COOLDOWN - (now - user["last_bonus"])
-            hours = left // 3600
-            minutes = (left % 3600) // 60
-            bot.answer_callback_query(
-                call.id,
-                text=f"⏳ Бонус будет доступен через {hours}ч {minutes}м",
-                show_alert=True
+    if action == "bind":
+        bot.answer_callback_query(call.id)
+        user_states[uid] = {"state": "waiting_channel", "data": {}}
+        try:
+            bot.edit_message_text(
+                "📡 <b>Привязка канала</b>\n\n"
+                "Отправьте одно из:\n\n"
+                "• <b>@username</b> публичного канала "
+                "(например, <code>@my_channel</code>)\n"
+                "• <b>Перешлите</b> любое сообщение из приватного канала\n\n"
+                "⚠️ Перед этим добавьте меня в канал как "
+                "<b>администратора</b> с правом публикации сообщений.",
+                chat_id=chat_id, message_id=msg_id, reply_markup=cancel_kb()
             )
-            return
-        bonus = random.randint(DAILY_BONUS_MIN, DAILY_BONUS_MAX)
-        db_update_stars(user_id, bonus)
-        db_set_last_bonus(user_id, now)
-        new_balance = user["stars"] + bonus
-        bot.answer_callback_query(call.id, text=f"🎁 +{bonus} звёзд!", show_alert=True)
-        safe_edit(
-            call.message.chat.id,
-            call.message.message_id,
-            f"🎁 Ежедневный бонус получен!\n\n"
-            f"➕ Начислено: <b>+{bonus}</b> ⭐\n"
-            f"⭐ Баланс: <b>{new_balance}</b> звёзд",
-            back_menu()
-        )
+        except Exception:
+            bot.send_message(chat_id,
+                             "📡 Отправьте @username канала или перешлите "
+                             "сообщение из канала.",
+                             reply_markup=cancel_kb())
+        return
 
-    # --- Слоты (честные 50/50) ---
-    elif call.data == "game_slots":
-        bet = SLOT_BET
-        if not db_try_bet(user_id, bet, username):
-            bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
-            return
-
-        symbols = ["🍒", "🍋", "7️⃣", "💎", "⭐"]
-
-        # Честный бросок: 50% победа
-        if random.random() < 0.5:
-            # Выигрыш — три одинаковых
-            symbol = random.choice(symbols)
-            spin = [symbol, symbol, symbol]
-            win = bet * 2
-            db_update_stars(user_id, win)
-            db_update_after_game(user_id, win - bet)
-            msg = f"🎰 [ {' | '.join(spin)} ]\n\n🎉 <b>ПОБЕДА!</b> +{bet} ⭐"
-        else:
-            # Проигрыш — гарантированно разные символы
-            while True:
-                spin = [random.choice(symbols) for _ in range(3)]
-                if not (spin[0] == spin[1] == spin[2]):
-                    break
-            db_update_after_game(user_id, -bet)
-            msg = f"🎰 [ {' | '.join(spin)} ]\n\n😢 Не повезло. -{bet} ⭐"
-
-        new_user = db_get_user(user_id)
+    if action == "list":
         bot.answer_callback_query(call.id)
-        safe_edit(
-            call.message.chat.id,
-            call.message.message_id,
-            f"{msg}\n\n⭐ Баланс: <b>{new_user['stars']}</b>",
-            after_game_menu()
-        )
+        show_user_posts(chat_id, uid)
+        return
 
-    # --- Кубик (честные 50/50) ---
-    elif call.data == "game_dice":
-        bet = DICE_BET
-        if not db_try_bet(user_id, bet, username):
-            bot.answer_callback_query(call.id, text=f"❌ Нужно {bet} ⭐", show_alert=True)
+    if action == "create":
+        # проверим, есть ли привязанные каналы
+        chans = db_get_channels(uid)
+        if not chans:
+            bot.answer_callback_query(call.id, "Сначала привяжите канал", show_alert=True)
             return
+        bot.answer_callback_query(call.id)
+        user_states[uid] = {"state": "waiting_channel_choice", "data": {}}
+        try:
+            bot.edit_message_text("📢 <b>Выберите канал для публикации:</b>",
+                                  chat_id=chat_id, message_id=msg_id,
+                                  reply_markup=channels_picker_kb(uid, "pickch"))
+        except Exception:
+            bot.send_message(chat_id, "📢 Выберите канал для публикации:",
+                             reply_markup=channels_picker_kb(uid, "pickch"))
+        return
 
-        # Честный бросок: 50% победа
-        if random.random() < 0.5:
-            player = random.randint(4, 6)
-            dealer = random.randint(1, 3)
-            win = bet * 2
-            db_update_stars(user_id, win)
-            db_update_after_game(user_id, win - bet)
-            msg = (
-                f"🎲 Ты: <b>{player}</b>\n"
-                f"🎲 Дилер: <b>{dealer}</b>\n\n"
-                f"🎉 <b>Победа!</b> +{bet} ⭐"
+    if action == "manual_time":
+        st = user_states.get(uid)
+        if not st or st["state"] not in ("waiting_time", "waiting_time_manual"):
+            bot.answer_callback_query(call.id, "Сначала отправьте содержимое")
+            return
+        st["state"] = "waiting_time_manual"
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(
+                "🕒 Введите дату и время в формате:\n"
+                "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+                "Пример: <code>25.12.2025 18:30</code>",
+                chat_id=chat_id, message_id=msg_id, reply_markup=cancel_kb()
             )
-        else:
-            player = random.randint(1, 3)
-            dealer = random.randint(4, 6)
-            db_update_after_game(user_id, -bet)
-            msg = (
-                f"🎲 Ты: <b>{player}</b>\n"
-                f"🎲 Дилер: <b>{dealer}</b>\n\n"
-                f"😢 Проигрыш. -{bet} ⭐"
-            )
+        except Exception:
+            pass
+        return
 
-        new_user = db_get_user(user_id)
-        bot.answer_callback_query(call.id)
-        safe_edit(
-            call.message.chat.id,
-            call.message.message_id,
-            f"{msg}\n\n⭐ Баланс: <b>{new_user['stars']}</b>",
-            after_game_menu()
-        )
-
-    # --- Монетка: показываем выбор стороны ---
-    elif call.data == "game_coin":
-        if user["stars"] < COIN_BET:
-            bot.answer_callback_query(call.id, text=f"❌ Нужно {COIN_BET} ⭐", show_alert=True)
+    if action == "confirm":
+        st = user_states.get(uid)
+        if not st or st["state"] != "confirming":
+            bot.answer_callback_query(call.id, "Нечего подтверждать")
             return
+        d = st["data"]
+        post_id = db_add_post(uid, d["channel_id"], d["content_type"],
+                              d.get("text", ""), d.get("file_id"),
+                              d["publish_at"])
+        user_states.pop(uid, None)
+        bot.answer_callback_query(call.id, "Запланировано ✅")
+        try:
+            bot.edit_message_text(
+                f"✅ Пост #{post_id} для канала "
+                f"<b>{d['channel_title']}</b> запланирован на "
+                f"<code>{d['publish_at'].strftime('%d.%m.%Y %H:%M')}</code>",
+                chat_id=chat_id, message_id=msg_id, reply_markup=main_menu_kb()
+            )
+        except Exception:
+            pass
+        log.info(f"Запланирован пост #{post_id} → канал {d['channel_id']}")
+        return
+
+    if action == "rewrite_text":
+        st = user_states.get(uid)
+        if not st or "content_type" not in st.get("data", {}):
+            bot.answer_callback_query(call.id, "Сессия устарела")
+            return
+        st["state"] = "waiting_content"
+        st["data"].pop("content_type", None)
+        st["data"].pop("file_id", None)
+        st["data"].pop("text", None)
         bot.answer_callback_query(call.id)
-        safe_edit(
-            call.message.chat.id,
-            call.message.message_id,
-            f"🪙 <b>Монетка</b>\n\nСтавка: {COIN_BET} ⭐\nВыбери сторону:",
-            coin_choice_menu()
-        )
+        try:
+            bot.edit_message_text("✍️ Отправьте новое содержимое поста.",
+                                  chat_id=chat_id, message_id=msg_id,
+                                  reply_markup=cancel_kb())
+        except Exception:
+            pass
+        return
 
-    # --- Монетка: выбран Орёл ---
-    elif call.data == "coin_heads":
-        play_coin(call, user_id, username, "Орёл")
-
-    # --- Монетка: выбрана Решка ---
-    elif call.data == "coin_tails":
-        play_coin(call, user_id, username, "Решка")
-
-    # --- Неизвестный callback ---
-    else:
-        bot.answer_callback_query(call.id, text="Неизвестная команда 🤔")
-
-
-# ============ ЗАПУСК ============
-if __name__ == "__main__":
-    db_init()
-    print("🚀 Казино-бот запущено. Ожидаю сообщений...")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+    if action == "rewrite_time":
+        st = user_states.get(uid)
+        if not st or "content_type" not in st.get("data", {}):
+           
