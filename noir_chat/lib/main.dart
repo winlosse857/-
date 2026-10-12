@@ -168,7 +168,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final filtered = conversations.where((c) => ('\${c['title']} \${c['description']}').toLowerCase().contains(search.toLowerCase())).toList();
+    final filtered = conversations.where((c) => ('${c['title']} ${c['description']}').toLowerCase().contains(search.toLowerCase())).toList();
     final visible = tab == 1 ? filtered.where((c) => joined.contains(c['id'].toString())).toList() : filtered;
     return Scaffold(
       appBar: AppBar(title: const Text('Dolbagram', style: TextStyle(fontSize: 21, fontWeight: FontWeight.w600)),
@@ -190,7 +190,7 @@ class _HomeScreenState extends State<HomeScreen> {
         onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Создание личных чатов добавим следующим этапом.'))),
         child: const Icon(Icons.edit)),
       bottomNavigationBar: NavigationBar(backgroundColor: Colors.white, indicatorColor: const Color(0xFFDDECF8),
-        selectedIndex: tab, onDestinationSelected: (v) => setState(() => tab = v),
+        selectedIndex: tab, onDestinationSelected: (v) { if (v == 2) { showProfile(); } else { setState(() => tab = v); } },
         destinations: const [
           NavigationDestination(icon: Icon(Icons.chat_bubble_outline), selectedIcon: Icon(Icons.chat), label: 'Чаты'),
           NavigationDestination(icon: Icon(Icons.people_outline), selectedIcon: Icon(Icons.people), label: 'Мои чаты'),
@@ -279,7 +279,7 @@ class _ChatScreenState extends State<ChatScreen> {
           final m = list[i]; final mine = m['sender_id'] == supabase.auth.currentUser?.id;
           final name = mine ? widget.myName : (names[m['sender_id'].toString()] ?? 'Пользователь');
           final dt = DateTime.tryParse(m['created_at']?.toString() ?? '')?.toLocal();
-          final time = dt == null ? '' : '\${dt.hour.toString().padLeft(2, '0')}:\${dt.minute.toString().padLeft(2, '0')}';
+          final time = dt == null ? '' : '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
           return Align(alignment: mine ? Alignment.centerRight : Alignment.centerLeft, child: Container(
             constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * .82),
             margin: const EdgeInsets.only(bottom: 8), padding: const EdgeInsets.fromLTRB(12, 8, 12, 7),
