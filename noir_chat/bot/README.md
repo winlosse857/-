@@ -1,4 +1,4 @@
-# NOIR Telegram identity bot (prototype)
+# Dolbagram Telegram identity bot (prototype)
 
 This bot assigns one stable, unique internal NOIR ID to each Telegram account. It is not a phone-number provider: IDs do not receive calls or SMS. The first version stores mappings in a local SQLite database, so deploy it on a persistent host/volume before real use.
 
