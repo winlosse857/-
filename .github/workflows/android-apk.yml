@@ -1,4 +1,4 @@
-name: Build NOIR Android APK
+name: Build Dolbagram Android APK
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
           cache: true
       - name: Generate Android platform files if missing
         working-directory: noir_chat
-        run: flutter create --platforms=android --org com.noir --project-name noir_chat .
+        run: flutter create --platforms=android --org com.dolbagram --project-name dolbagram .
       - name: Install dependencies
         working-directory: noir_chat
         run: flutter pub get
@@ -38,6 +38,6 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: noir-android-apk
+          name: dolbagram-android-apk
           path: noir_chat/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
