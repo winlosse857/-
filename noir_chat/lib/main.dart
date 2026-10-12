@@ -240,6 +240,26 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> editDisplayName() async {
+    final controller = TextEditingController(text: displayName);
+    final value = await showDialog<String>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Изменить имя'),
+      content: TextField(controller: controller, maxLength: 40, decoration: const InputDecoration(labelText: 'Имя в Dolbagram')),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, controller.text.trim()), child: const Text('Сохранить')),
+      ],
+    ));
+    controller.dispose();
+    if (value == null || value.length < 2) return;
+    try {
+      await supabase.from('dolbagram_profiles').update({'display_name': value}).eq('id', supabase.auth.currentUser!.id);
+      if (mounted) setState(() => displayName = value);
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Не удалось сохранить имя.')));
+    }
+  }
+
   Future<void> showProfile() async {
     await showModalBottomSheet<void>(context: context, showDragHandle: true, builder: (ctx) => SafeArea(
       child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -247,7 +267,9 @@ class _HomeScreenState extends State<HomeScreen> {
         const SizedBox(height: 12), Text(displayName, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
         const SizedBox(height: 4), Text(noirId, style: const TextStyle(color: muted)),
         Text(supabase.auth.currentUser?.email ?? '', style: const TextStyle(color: muted)),
-        const SizedBox(height: 18),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(onPressed: () { Navigator.pop(ctx); editDisplayName(); },
+          icon: const Icon(Icons.edit), label: const Text('Изменить имя')),
         OutlinedButton.icon(onPressed: () async { Navigator.pop(ctx); await supabase.auth.signOut(); },
           icon: const Icon(Icons.logout), label: const Text('Выйти из аккаунта')),
       ])),
