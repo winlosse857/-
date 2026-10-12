@@ -47,9 +47,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     noir_id = get_or_create_identity(user.id)
     display_id = f"+888 {noir_id}" if noir_id == OWNER_NOIR_ID else noir_id
-    owner_note = "\n\nСтатус: владелец NOIR" if noir_id == OWNER_NOIR_ID else ""
+    owner_note = "\n\nСтатус: владелец Dolbagram" if noir_id == OWNER_NOIR_ID else ""
     await update.message.reply_text(
-        "Добро пожаловать в NOIR Messenger!\n\n"
+        "Добро пожаловать в Dolbagram!\n\n"
         f"Твой ID NOIR: {display_id}{owner_note}\n\n"
         "Это виртуальный идентификатор NOIR, а не настоящий телефонный номер: "
         "он не принимает SMS и звонки. Подтверждение входа в приложении через Telegram "
