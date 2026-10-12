@@ -144,7 +144,7 @@ class _LoginScreenState extends State<LoginScreen> {
     super.dispose();
   }
 
-  String get normalizedPhone => phone.text.trim().replaceAll(RegExp(r'[\\s()-]'), '');
+  String get normalizedPhone => phone.text.trim().replaceAll(RegExp(r'[\s()-]'), '');
 
   Future<void> requestCode() async {
     setState(() { busy = true; error = null; notice = null; });
@@ -153,7 +153,7 @@ class _LoginScreenState extends State<LoginScreen> {
         throw const AuthException('Укажи имя минимум из 2 символов.');
       }
       final value = normalizedPhone;
-      if (!RegExp(r'^\\+[1-9]\\d{7,14}$').hasMatch(value)) {
+      if (!RegExp(r'^\+[1-9]\d{7,14}$').hasMatch(value)) {
         throw const AuthException('Введи номер в международном формате, например +491234567890.');
       }
       await supabase.auth.signInWithOtp(
