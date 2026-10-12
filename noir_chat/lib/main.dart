@@ -269,7 +269,7 @@ class _HomeScreenState extends State<HomeScreen> {
         Expanded(child: loading ? const Center(child: CircularProgressIndicator())
           : loadError != null ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisSize: MainAxisSize.min, children: [
               Text(loadError!, textAlign: TextAlign.center), const SizedBox(height: 14), FilledButton(onPressed: loadHome, child: const Text('Повторить')),
-            ]))
+            ])))
           : visible.isEmpty ? Center(child: Text(tab == 1 ? 'Ты пока не вступил ни в один чат.' : 'Ничего не найдено.', style: const TextStyle(color: muted)))
           : ListView.separated(itemCount: visible.length, separatorBuilder: (_, __) => const Divider(height: 1, indent: 82),
               itemBuilder: (context, i) => _chatTile(visible[i]))),
