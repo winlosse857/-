@@ -44,60 +44,116 @@ class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
   @override State<LoginScreen> createState() => _LoginScreenState();
 }
-class _LoginScreenState extends State<LoginScreen> {
-  final email = TextEditingController(), password = TextEditingController(), displayName = TextEditingController();
-  bool signup = false, busy = false;
-  String? error;
-  @override void dispose() { email.dispose(); password.dispose(); displayName.dispose(); super.dispose(); }
 
-  Future<void> submit() async {
-    setState(() { busy = true; error = null; });
+class _LoginScreenState extends State<LoginScreen> {
+  final phone = TextEditingController();
+  final code = TextEditingController();
+  final displayName = TextEditingController();
+  bool codeSent = false, busy = false;
+  String? error;
+  String? notice;
+
+  @override
+  void dispose() {
+    phone.dispose();
+    code.dispose();
+    displayName.dispose();
+    super.dispose();
+  }
+
+  String get normalizedPhone => phone.text.trim().replaceAll(RegExp(r'[\\s()-]'), '');
+
+  Future<void> requestCode() async {
+    setState(() { busy = true; error = null; notice = null; });
     try {
-      if (signup) {
-        if (displayName.text.trim().length < 2) throw const AuthException('Укажи имя минимум из 2 символов.');
-        final result = await supabase.auth.signUp(email: email.text.trim(), password: password.text,
-          data: {'display_name': displayName.text.trim()});
-        if (result.session == null && mounted) setState(() {
-          error = 'Аккаунт создан. Подтверди почту, затем войди.'; signup = false;
-        });
-      } else {
-        await supabase.auth.signInWithPassword(email: email.text.trim(), password: password.text);
+      if (displayName.text.trim().length < 2) {
+        throw const AuthException('Укажи имя минимум из 2 символов.');
       }
+      final value = normalizedPhone;
+      if (!RegExp(r'^\\+[1-9]\\d{7,14}$').hasMatch(value)) {
+        throw const AuthException('Введи номер в международном формате, например +491234567890.');
+      }
+      await supabase.auth.signInWithOtp(
+        phone: value,
+        shouldCreateUser: true,
+        data: {'display_name': displayName.text.trim()},
+      );
+      if (mounted) setState(() {
+        codeSent = true;
+        notice = 'Если номер поддерживается, код отправлен по SMS.';
+      });
     } on AuthException catch (e) {
       if (mounted) setState(() => error = e.message);
     } catch (_) {
-      if (mounted) setState(() => error = 'Не удалось выполнить запрос. Проверь соединение.');
-    } finally { if (mounted) setState(() => busy = false); }
+      if (mounted) setState(() => error = 'Не удалось отправить код. Проверь номер и соединение.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> verifyCode() async {
+    setState(() { busy = true; error = null; notice = null; });
+    try {
+      final value = normalizedPhone;
+      if (code.text.trim().length < 4) {
+        throw const AuthException('Введи код из SMS.');
+      }
+      await supabase.auth.verifyOTP(
+        phone: value,
+        token: code.text.trim(),
+        type: OtpType.sms,
+      );
+    } on AuthException catch (e) {
+      if (mounted) setState(() => error = e.message);
+    } catch (_) {
+      if (mounted) setState(() => error = 'Не удалось подтвердить код. Попробуй ещё раз.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    backgroundColor: Colors.white,
+    backgroundColor: const Color(0xFF1D2935),
     body: SafeArea(child: Center(child: SingleChildScrollView(
       padding: const EdgeInsets.all(26),
       child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 420), child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Container(height: 82, alignment: Alignment.center,
-            decoration: BoxDecoration(color: accent, borderRadius: BorderRadius.circular(26)),
-            child: const Icon(Icons.send_rounded, color: Colors.white, size: 40)),
+          Container(height: 92, alignment: Alignment.center,
+            decoration: BoxDecoration(color: const Color(0xFF279FEA), borderRadius: BorderRadius.circular(30)),
+            child: const Icon(Icons.send_rounded, color: Colors.white, size: 48)),
           const SizedBox(height: 20),
-          const Text('Dolbagram', textAlign: TextAlign.center, style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+          const Text('Dolbagram', textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800, color: Colors.white)),
           const SizedBox(height: 8),
-          Text(signup ? 'Создай аккаунт и начни общаться.' : 'Войди, чтобы продолжить.',
-            textAlign: TextAlign.center, style: const TextStyle(color: muted)),
+          Text(codeSent ? 'Введи код подтверждения' : 'Общайся по своему номеру телефона.',
+            textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
           const SizedBox(height: 28),
-          if (signup) ...[TextField(controller: displayName, decoration: const InputDecoration(labelText: 'Имя в Dolbagram')), const SizedBox(height: 12)],
-          TextField(controller: email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Электронная почта', prefixIcon: Icon(Icons.mail_outline))),
-          const SizedBox(height: 12),
-          TextField(controller: password, obscureText: true, decoration: const InputDecoration(labelText: 'Пароль', prefixIcon: Icon(Icons.lock_outline))),
-          if (error != null) ...[const SizedBox(height: 14), Text(error!, style: TextStyle(color: error!.startsWith('Аккаунт создан') ? Colors.green : Colors.red))],
+          if (!codeSent) ...[
+            TextField(controller: displayName, textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(labelText: 'Как тебя называть?', prefixIcon: Icon(Icons.person_outline))),
+            const SizedBox(height: 12),
+            TextField(controller: phone, keyboardType: TextInputType.phone,
+              decoration: const InputDecoration(labelText: 'Номер телефона', hintText: '+491234567890', prefixIcon: Icon(Icons.phone_outlined))),
+          ] else ...[
+            Text('Код отправлен на ${normalizedPhone}', textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 12),
+            TextField(controller: code, keyboardType: TextInputType.number, autofocus: true,
+              maxLength: 8, decoration: const InputDecoration(labelText: 'Код из SMS', prefixIcon: Icon(Icons.sms_outlined))),
+          ],
+          if (notice != null) ...[const SizedBox(height: 12), Text(notice!, style: const TextStyle(color: Colors.lightGreenAccent))],
+          if (error != null) ...[const SizedBox(height: 12), Text(error!, style: const TextStyle(color: Colors.redAccent))],
           const SizedBox(height: 18),
-          FilledButton(onPressed: busy ? null : submit, style: FilledButton.styleFrom(backgroundColor: accent, padding: const EdgeInsets.all(15)),
-            child: Text(busy ? 'Подожди…' : signup ? 'Создать аккаунт' : 'Войти')),
-          TextButton(onPressed: busy ? null : () => setState(() { signup = !signup; error = null; }),
-            child: Text(signup ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Зарегистрироваться')),
+          FilledButton(onPressed: busy ? null : (codeSent ? verifyCode : requestCode),
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFF279FEA), padding: const EdgeInsets.all(15)),
+            child: Text(busy ? 'Подожди…' : codeSent ? 'Подтвердить код' : 'Получить код по SMS')),
+          if (codeSent) TextButton(onPressed: busy ? null : () => setState(() {
+            codeSent = false; code.clear(); error = null; notice = null;
+          }), child: const Text('Изменить номер', style: TextStyle(color: Colors.white70))),
           const SizedBox(height: 12),
-          const Text('ID пользователей сохраняются в формате NOIR.', textAlign: TextAlign.center, style: TextStyle(color: muted, fontSize: 12)),
+          const Text('После входа за тобой закрепляется NOIR ID.',
+            textAlign: TextAlign.center, style: TextStyle(color: Colors.white60, fontSize: 12)),
         ],
       )),
     ))),
