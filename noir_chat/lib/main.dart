@@ -8,8 +8,8 @@ const violet = Color(0xFF9B7BFF);
 const cyan = Color(0xFF65E6D2);
 const muted = Color(0xFF9299AD);
 
-class NoirApp extends StatelessWidget {
-  const NoirApp({super.key});
+class DolbagramApp extends StatelessWidget {
+  const DolbagramApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Dolbagram',
