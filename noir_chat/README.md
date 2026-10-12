@@ -1,4 +1,4 @@
-# NOIR — Android chat prototype
+# Dolbagram — Android chat prototype
 
 Dark, modern Flutter app for topic-based community rooms.
 
@@ -24,4 +24,4 @@ flutter build apk --release
 APK output: `build/app/outputs/flutter-apk/app-release.apk`.
 
 ## GitHub Actions
-Push changes under `noir_chat/**` or manually run **Build NOIR Android APK**. Download the `noir-android-apk` artifact from the workflow run.
+Push changes under `noir_chat/**` or manually run **Build Dolbagram Android APK**. Download the `dolbagram-android-apk` artifact from the workflow run.
