@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-void main() => runApp(const NoirApp());
+void main() => runApp(const DolbagramApp());
 
 const bg = Color(0xFF090B12);
 const panel = Color(0xFF151925);
@@ -12,7 +12,7 @@ class NoirApp extends StatelessWidget {
   const NoirApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'NOIR',
+    title: 'Dolbagram',
     debugShowCheckedModeBanner: false,
     theme: ThemeData(useMaterial3: true, brightness: Brightness.dark,
       scaffoldBackgroundColor: bg,
@@ -73,7 +73,7 @@ class _HomeScreenState extends State<HomeScreen> {
       gradient:const LinearGradient(colors:[violet,Color(0xFF5B4BC4)])),
       child:const Icon(Icons.nightlight_round,color:Colors.white)),
     const SizedBox(width:12),
-    const Text('NOIR',style:TextStyle(fontSize:22,letterSpacing:4,fontWeight:FontWeight.w800)),
+    const Text('Dolbagram',style:TextStyle(fontSize:20,letterSpacing:1.5,fontWeight:FontWeight.w800)),
     const Spacer(),
     Container(padding:const EdgeInsets.symmetric(horizontal:11,vertical:8),
       decoration:BoxDecoration(color:panel,borderRadius:BorderRadius.circular(20)),
