@@ -8,7 +8,7 @@ on:
       - '.github/workflows/android-apk.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -41,3 +41,16 @@ jobs:
           name: dolbagram-android-apk
           path: noir_chat/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+
+      - name: Publish direct APK download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dolbagram-latest --yes || true
+          git push origin :refs/tags/dolbagram-latest || true
+          gh release create dolbagram-latest noir_chat/build/app/outputs/flutter-apk/app-release.apk \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Dolbagram — latest Android APK" \
+            --notes "Latest automated Dolbagram Android build. Download Dolbagram.apk and open it on your Android device." \
+            --prerelease \
+            --latest=false
