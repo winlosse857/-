@@ -4,6 +4,7 @@ Dolbagram is an Android Flutter app with a Telegram-inspired interface and a Sup
 
 ## Current features
 - Phone-number registration and sign-in using SMS OTP through Supabase Auth
+- Optional recovery email prompt after phone verification; users can link an email or skip it
 - Editable display name and NOIR-style user ID
 - Public group list, group joining, and persistent group messages
 - Search for registered users by name or NOIR ID and start direct chats

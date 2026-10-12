@@ -36,7 +36,90 @@ class AuthGate extends StatelessWidget {
   @override
   Widget build(BuildContext context) => StreamBuilder<AuthState>(
     stream: supabase.auth.onAuthStateChange,
-    builder: (context, snapshot) => supabase.auth.currentSession == null ? const LoginScreen() : const HomeScreen(),
+    builder: (context, snapshot) {
+      final user = supabase.auth.currentUser;
+      if (user == null) return const LoginScreen();
+      final metadata = user.userMetadata ?? <String, dynamic>{};
+      final needsRecoveryEmail = (user.email == null || user.email!.isEmpty) &&
+          metadata['recovery_email_prompt_done'] != true;
+      return needsRecoveryEmail ? const RecoveryEmailScreen() : const HomeScreen();
+    },
+  );
+}
+
+class RecoveryEmailScreen extends StatefulWidget {
+  const RecoveryEmailScreen({super.key});
+  @override
+  State<RecoveryEmailScreen> createState() => _RecoveryEmailScreenState();
+}
+
+class _RecoveryEmailScreenState extends State<RecoveryEmailScreen> {
+  final email = TextEditingController();
+  bool busy = false;
+  String? error;
+  String? notice;
+
+  @override
+  void dispose() {
+    email.dispose();
+    super.dispose();
+  }
+
+  Future<void> finish({bool skip = false}) async {
+    setState(() { busy = true; error = null; notice = null; });
+    try {
+      final value = email.text.trim();
+      if (!skip && !RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(value)) {
+        throw const AuthException('Введи корректный адрес электронной почты.');
+      }
+      await supabase.auth.updateUser(UserAttributes(
+        email: skip ? null : value,
+        data: {'recovery_email_prompt_done': true},
+      ));
+      if (!mounted) return;
+      setState(() => notice = skip
+        ? 'Почту можно привязать позже в настройках профиля.'
+        : 'Запрос отправлен. Если подтверждение почты включено, открой письмо и подтверди адрес.');
+    } on AuthException catch (e) {
+      if (mounted) setState(() => error = e.message);
+    } catch (_) {
+      if (mounted) setState(() => error = 'Не удалось сохранить почту. Попробуй ещё раз.');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: pageBg,
+    body: SafeArea(child: Center(child: SingleChildScrollView(
+      padding: const EdgeInsets.all(26),
+      child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 420), child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Container(height: 88, alignment: Alignment.center,
+            decoration: BoxDecoration(color: const Color(0xFF279FEA), borderRadius: BorderRadius.circular(28)),
+            child: const Icon(Icons.send_rounded, color: Colors.white, size: 46)),
+          const SizedBox(height: 22),
+          const Text('Защити свой аккаунт', textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          const Text('Привяжи почту, чтобы упростить восстановление доступа, если потеряешь номер телефона. Это необязательно.',
+            textAlign: TextAlign.center, style: TextStyle(color: muted)),
+          const SizedBox(height: 24),
+          TextField(controller: email, keyboardType: TextInputType.emailAddress,
+            autofillHints: const [AutofillHints.email],
+            decoration: const InputDecoration(labelText: 'Электронная почта (необязательно)', prefixIcon: Icon(Icons.email_outlined))),
+          if (notice != null) ...[const SizedBox(height: 12), Text(notice!, style: const TextStyle(color: Colors.green))],
+          if (error != null) ...[const SizedBox(height: 12), Text(error!, style: const TextStyle(color: Colors.redAccent))],
+          const SizedBox(height: 18),
+          FilledButton(onPressed: busy ? null : () => finish(),
+            style: FilledButton.styleFrom(backgroundColor: accent, padding: const EdgeInsets.all(15)),
+            child: Text(busy ? 'Подожди…' : 'Привязать почту')),
+          TextButton(onPressed: busy ? null : () => finish(skip: true),
+            child: const Text('Пропустить пока')),
+        ],
+      )),
+    ))),
   );
 }
 
