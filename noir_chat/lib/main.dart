@@ -17,7 +17,7 @@ class DolbagramApp extends StatelessWidget {
     theme: ThemeData(useMaterial3: true, brightness: Brightness.light,
       scaffoldBackgroundColor: bg,
       colorScheme: const ColorScheme.light(primary: violet, secondary: cyan, surface: panel),
-      inputDecorationTheme: InputDecorationTheme(filled: true, fillColor: const Color(0xFF202536),
+      inputDecorationTheme: InputDecorationTheme(filled: true, fillColor: const Color(0xFFF0F2F5),
         hintStyle: const TextStyle(color: muted),
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none))),
     home: const HomeScreen());
