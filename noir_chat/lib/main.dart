@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -123,13 +124,28 @@ class _HomeScreenState extends State<HomeScreen> {
       final user = supabase.auth.currentUser!;
       final profile = await supabase.from('dolbagram_profiles').select('display_name,noir_id').eq('id', user.id).maybeSingle();
       final memberships = await supabase.from('dolbagram_conversation_members').select('conversation_id').eq('user_id', user.id);
-      final rows = await supabase.from('dolbagram_conversations').select('id,kind,title,description,is_public,updated_at').eq('is_public', true).order('updated_at');
+      final memberIds = memberships.map((e) => e['conversation_id'].toString()).toSet();
+      final publicRows = await supabase.from('dolbagram_conversations').select('id,kind,title,description,is_public,updated_at').eq('is_public', true).order('updated_at');
+      final privateRows = memberIds.isEmpty ? <Map<String, dynamic>>[] :
+        List<Map<String, dynamic>>.from(await supabase.from('dolbagram_conversations').select('id,kind,title,description,is_public,updated_at').inFilter('id', memberIds.toList()));
+      final merged = <String, Map<String, dynamic>>{};
+      for (final row in publicRows) { merged[row['id'].toString()] = Map<String, dynamic>.from(row); }
+      for (final row in privateRows) { merged[row['id'].toString()] = Map<String, dynamic>.from(row); }
+      for (final row in merged.values.where((r) => r['kind'] == 'direct')) {
+        final peers = await supabase.from('dolbagram_conversation_members').select('user_id').eq('conversation_id', row['id']);
+        final peer = peers.map((m) => m['user_id'].toString()).where((id) => id != user.id).firstOrNull;
+        if (peer != null) {
+          final peerProfile = await supabase.from('dolbagram_profiles').select('display_name,username').eq('id', peer).maybeSingle();
+          row['title'] = peerProfile?['display_name'] ?? peerProfile?['username'] ?? 'Личный чат';
+          row['description'] = 'Личный чат';
+        }
+      }
       if (!mounted) return;
       setState(() {
         displayName = (profile?['display_name'] as String?) ?? user.email?.split('@').first ?? 'Пользователь';
         noirId = (profile?['noir_id'] as String?) ?? 'NOIR-…';
-        joined = memberships.map((e) => e['conversation_id'].toString()).toSet();
-        conversations = List<Map<String, dynamic>>.from(rows);
+        joined = memberIds;
+        conversations = merged.values.toList();
         loading = false;
       });
     } catch (_) {
@@ -149,6 +165,77 @@ class _HomeScreenState extends State<HomeScreen> {
       loadHome();
     } catch (_) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Не удалось войти в чат. Попробуй ещё раз.')));
+    }
+  }
+
+  String newUuid() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+  }
+
+  Future<void> chooseUser() async {
+    try {
+      final rows = await supabase.from('dolbagram_profiles').select('id,username,display_name,noir_id')
+        .neq('id', supabase.auth.currentUser!.id).order('display_name');
+      if (!mounted) return;
+      final selected = await showDialog<Map<String, dynamic>>(context: context, builder: (ctx) {
+        String query = '';
+        return StatefulBuilder(builder: (ctx, refresh) {
+          final filtered = List<Map<String, dynamic>>.from(rows).where((u) =>
+            ('${u['display_name']} ${u['username']} ${u['noir_id']}').toLowerCase().contains(query.toLowerCase())).toList();
+          return AlertDialog(
+            title: const Text('Новый личный чат'),
+            content: SizedBox(width: double.maxFinite, height: 420, child: Column(children: [
+              TextField(onChanged: (v) => refresh(() => query = v), decoration: const InputDecoration(hintText: 'Поиск по имени или NOIR ID', prefixIcon: Icon(Icons.search))),
+              const SizedBox(height: 8),
+              Expanded(child: filtered.isEmpty ? const Center(child: Text('Пользователи не найдены')) : ListView.builder(
+                itemCount: filtered.length,
+                itemBuilder: (_, i) {
+                  final u = filtered[i];
+                  return ListTile(
+                    leading: const CircleAvatar(backgroundColor: Color(0xFFDDECF8), child: Icon(Icons.person, color: blue)),
+                    title: Text(u['display_name']?.toString() ?? u['username']?.toString() ?? 'Пользователь'),
+                    subtitle: Text('${u['noir_id']} · @${u['username']}'),
+                    onTap: () => Navigator.pop(ctx, u),
+                  );
+                },
+              )),
+            ])),
+            actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена'))],
+          );
+        });
+      });
+      if (selected != null) await createDirectChat(selected);
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Не удалось загрузить список пользователей.')));
+    }
+  }
+
+  Future<void> createDirectChat(Map<String, dynamic> target) async {
+    final me = supabase.auth.currentUser!.id;
+    final id = newUuid();
+    final targetName = target['display_name']?.toString() ?? target['username']?.toString() ?? 'Личный чат';
+    try {
+      await supabase.from('dolbagram_conversations').insert({
+        'id': id, 'kind': 'direct', 'title': targetName, 'description': 'Личный чат',
+        'is_public': false, 'created_by': me,
+      });
+      await supabase.from('dolbagram_conversation_members').insert({'conversation_id': id, 'user_id': me, 'role': 'owner'});
+      await supabase.from('dolbagram_conversation_members').insert({'conversation_id': id, 'user_id': target['id'], 'role': 'member'});
+      final conversation = <String, dynamic>{
+        'id': id, 'kind': 'direct', 'title': targetName, 'description': 'Личный чат',
+        'is_public': false, 'updated_at': DateTime.now().toIso8601String(),
+      };
+      if (!mounted) return;
+      setState(() { joined.add(id); conversations.add(conversation); });
+      await Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(conversation: conversation, myName: displayName)));
+      loadHome();
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Не удалось создать личный чат.')));
     }
   }
 
@@ -187,7 +274,7 @@ class _HomeScreenState extends State<HomeScreen> {
               itemBuilder: (context, i) => _chatTile(visible[i]))),
       ]),
       floatingActionButton: FloatingActionButton(backgroundColor: accent, foregroundColor: Colors.white,
-        onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Создание личных чатов добавим следующим этапом.'))),
+        onPressed: chooseUser,
         child: const Icon(Icons.edit)),
       bottomNavigationBar: NavigationBar(backgroundColor: Colors.white, indicatorColor: const Color(0xFFDDECF8),
         selectedIndex: tab, onDestinationSelected: (v) { if (v == 2) { showProfile(); } else { setState(() => tab = v); } },
