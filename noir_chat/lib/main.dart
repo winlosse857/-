@@ -133,7 +133,8 @@ class _HomeScreenState extends State<HomeScreen> {
       for (final row in privateRows) { merged[row['id'].toString()] = Map<String, dynamic>.from(row); }
       for (final row in merged.values.where((r) => r['kind'] == 'direct')) {
         final peers = await supabase.from('dolbagram_conversation_members').select('user_id').eq('conversation_id', row['id']);
-        final peer = peers.map((m) => m['user_id'].toString()).where((id) => id != user.id).firstOrNull;
+        final peerIds = peers.map((m) => m['user_id'].toString()).where((id) => id != user.id).toList();
+        final peer = peerIds.isEmpty ? null : peerIds.first;
         if (peer != null) {
           final peerProfile = await supabase.from('dolbagram_profiles').select('display_name,username').eq('id', peer).maybeSingle();
           row['title'] = peerProfile?['display_name'] ?? peerProfile?['username'] ?? 'Личный чат';
