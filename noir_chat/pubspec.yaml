@@ -1,5 +1,5 @@
-name: noir_chat
-description: NOIR dark modern community chat for Android.
+name: dolbagram
+description: Dolbagram dark modern community chat for Android.
 publish_to: "none"
 version: 1.0.0+1
 environment:
